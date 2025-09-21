@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
-# 页面配置（适配日内交易场景）
+# 页面配置（适配香港股市日内交易场景）
 st.set_page_config(
-    page_title="日内T+0网格交易工具",
+    page_title="香港股市日内T+0网格交易工具",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -395,16 +395,16 @@ def calculate_max_drawdown(trade_records, principal):
 
 
 # --------------------------
-# 3. Streamlit界面（日内交易专用）
+# 3. Streamlit界面（香港股市日内交易专用）
 # --------------------------
 def main():
-    st.title("日内T+0网格交易策略工具")
-    st.write("🔍 适配0.5%-1.5%日内波动率，支持动态网格间距，高频触发优化")
+    st.title("香港股市日内T+0网格交易策略工具")
+    st.write("🔍 适配香港股市交易时间（09:30-12:00，13:00-16:00），支持动态网格间距")
     st.divider()
 
     # 初始化会话状态（保存数据和参数）
     if "minute_data" not in st.session_state:
-        # 生成默认分钟级数据（当日9:30-15:55，5分钟间隔）
+        # 生成默认分钟级数据（符合香港股市交易时间）
         st.session_state.minute_data = generate_default_minute_data()
     if "grid_params" not in st.session_state:
         st.session_state.grid_params = None
@@ -502,10 +502,10 @@ def main():
     # 主界面：分标签页
     tab1, tab2, tab3 = st.tabs(["📅 分钟级数据", "📈 网格策略", "📊 回测结果"])
 
-    # 标签页1：分钟级数据输入
+    # 标签页1：分钟级数据输入（已适配香港交易时间）
     with tab1:
-        st.subheader(f"日内{data_interval}分钟数据（当日交易时段）")
-        st.write("💡 提示：直接编辑表格，成交量支持1000、1k、0.1万等格式；点击【生成默认数据】快速填充")
+        st.subheader(f"日内{data_interval}分钟数据（香港交易时间：09:30-12:00，13:00-16:00）")
+        st.write("💡 提示：表格已自动过滤午休时间（12:00-13:00），成交量支持1000、1k、0.1万等格式")
         
         # 生成表格数据（字典列表，确保列名对应）
         table_data = []
@@ -530,7 +530,7 @@ def main():
         edited_table = st.data_editor(
             table_data,
             column_config={
-                "时间": st.column_config.TextColumn(disabled=False, help="格式：HH:MM，如09:30"),
+                "时间": st.column_config.TextColumn(disabled=False, help="格式：HH:MM，如09:30（仅支持09:30-12:00和13:00-16:00）"),
                 "最高价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
                 "最低价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
                 "收盘价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
@@ -552,6 +552,24 @@ def main():
                     if not time_str or len(time_str.split(":")) != 2:
                         st.warning(f"第{idx+1}行时间格式错误，跳过该条数据")
                         continue
+                    
+                    # 验证时间是否在香港交易时段内
+                    hour, minute = map(int, time_str.split(":"))
+                    is_valid = False
+                    # 上午时段：09:30-12:00
+                    if (hour == 9 and minute >= 30) or (10 <= hour < 12):
+                        is_valid = True
+                    # 下午时段：13:00-16:00
+                    elif 13 <= hour < 16:
+                        is_valid = True
+                    # 12:00整和16:00整特殊处理
+                    elif (hour == 12 and minute == 0) or (hour == 16 and minute == 0):
+                        is_valid = True
+                    
+                    if not is_valid:
+                        st.warning(f"第{idx+1}行时间不在交易时段内（12:00-13:00为休市时间），已跳过")
+                        continue
+                    
                     # 解析价格（确保合理）
                     high = float(row["最高价(港元)"])
                     low = float(row["最低价(港元)"])
@@ -571,20 +589,22 @@ def main():
                         "close": round(close, 4),
                         "volume": volume
                     })
+                # 按时间排序
+                updated_minute_data.sort(key=lambda x: datetime.strptime(x["time"], "%H:%M"))
                 # 保存更新后的数据
                 st.session_state.minute_data = updated_minute_data
-                st.success(f"成功保存{len(updated_minute_data)}条分钟级数据")
+                st.success(f"成功保存{len(updated_minute_data)}条分钟级数据（已过滤休市时间）")
             except Exception as e:
                 st.error(f"数据保存失败：{str(e)}")
 
         # 生成默认数据按钮
         if st.button("🔧 生成默认数据", use_container_width=True):
-            st.session_state.minute_data = generate_default_minute_data(current_price=current_price)
+            st.session_state.minute_data = generate_default_minute_data(current_price=current_price, interval=data_interval)
             st.rerun()  # 刷新页面显示新数据
 
     # 标签页2：网格策略计算结果
     with tab2:
-        st.subheader("网格策略参数（日内T+0优化）")
+        st.subheader("网格策略参数（香港股市日内T+0优化）")
         st.write("📌 关键指标：动态间距基于ATR，确保日内触发频率；成本已含滑点")
 
         # 计算按钮触发后显示结果
@@ -694,7 +714,19 @@ def main():
                         )
                         st.session_state.backtest_result = backtest_result
                         # 切换到回测结果标签页
-                        st.switch_page(st_pages[2])  # 需确保标签页顺序正确
+                        # 使用JavaScript实现标签页切换
+                        st.components.v1.html(
+                            f"""
+                            <script>
+                                // 找到第三个标签页并点击
+                                const tabs = window.parent.document.querySelectorAll('[data-testid="stTab"]');
+                                if (tabs.length >= 3) {{
+                                    tabs[2].click();
+                                }}
+                            </script>
+                            """,
+                            height=0,
+                        )
 
             except Exception as e:
                 st.error(f"策略计算失败：{str(e)}")
@@ -705,11 +737,10 @@ def main():
             st.info("请在左侧边栏设置参数后，点击【计算网格策略】按钮")
         # 已计算过，显示缓存结果
         else:
-            # 逻辑同计算按钮触发后（复用代码）
+            # 显示参数（同计算后逻辑）
             grid_params = st.session_state.grid_params
             buy_grids = st.session_state.get("buy_grids", [])
             sell_grids = st.session_state.get("sell_grids", [])
-            # 显示参数（同计算后逻辑，此处省略重复代码，实际需完整复制）
             st.info("已加载历史计算结果，点击【计算网格策略】可更新参数")
 
     # 标签页3：回测结果
@@ -793,9 +824,9 @@ def main():
                 st.error("❌ 策略回测亏损：不建议实盘，需调整参数（如扩大间距/减少档数）")
             
             st.write("💡 实盘注意事项：")
-            st.write("1. 日内交易需紧盯行情，避免尾盘单边行情")
-            st.write("2. 单次交易不超过本金5%，总仓位不超过50%")
-            st.write("3. 若1小时内无交易，可手动缩小间距0.05%-0.1%")
+            st.write("1. 注意香港市场交易时段：09:30-12:00和13:00-16:00，午间休市")
+            st.write("2. 收市前30分钟（15:30-16:00）波动较大，可适当扩大网格间距")
+            st.write("3. 单次交易不超过本金5%，总仓位不超过50%")
             st.write("4. 对接券商API时，需设置条件单有效期为当日")
 
         else:
@@ -813,21 +844,24 @@ def main():
 
 
 def generate_default_minute_data(current_price=27.5, interval=5):
-    """生成默认分钟级数据（当日9:30-15:55，5分钟间隔）"""
+    """生成符合香港股市交易时间的默认分钟级数据
+    时间段：09:30-12:00和13:00-16:00，跳过12:00-13:00午休时间
+    """
     minute_data = []
-    # 生成时间序列（9:30到15:55，5分钟间隔）
-    start_time = datetime.strptime("09:30", "%H:%M")
-    end_time = datetime.strptime("15:55", "%H:%M")
-    current_time = start_time
-    while current_time <= end_time:
+    
+    # 上午交易时段：09:30-12:00
+    start_morning = datetime.strptime("09:30", "%H:%M")
+    end_morning = datetime.strptime("12:00", "%H:%M")
+    current_time = start_morning
+    while current_time <= end_morning:
         # 生成随机价格（围绕当前价±0.3%波动）
         price_offset = np.random.uniform(-0.003, 0.003)
         close_price = current_price * (1 + price_offset)
         # 最高价=收盘价+0.05%-0.1%，最低价=收盘价-0.05%-0.1%
         high_price = close_price * (1 + np.random.uniform(0.0005, 0.001))
         low_price = close_price * (1 - np.random.uniform(0.0005, 0.001))
-        # 生成成交量（日内ETF典型成交量：5000-20000股/5分钟）
-        volume = int(np.random.uniform(5000, 20000))
+        # 生成成交量（上午时段成交量通常较高）
+        volume = int(np.random.uniform(8000, 25000))
         # 添加到数据列表
         minute_data.append({
             "time": current_time.strftime("%H:%M"),
@@ -836,12 +870,43 @@ def generate_default_minute_data(current_price=27.5, interval=5):
             "close": round(close_price, 4),
             "volume": volume
         })
-        # 时间递增5分钟
+        # 时间递增指定分钟数
         current_time += timedelta(minutes=interval)
+        # 确保不超过上午结束时间
+        if current_time > end_morning:
+            break
+    
+    # 下午交易时段：13:00-16:00
+    start_afternoon = datetime.strptime("13:00", "%H:%M")
+    end_afternoon = datetime.strptime("16:00", "%H:%M")
+    current_time = start_afternoon
+    while current_time <= end_afternoon:
+        # 生成随机价格（围绕当前价±0.3%波动，下午可能有新趋势）
+        price_offset = np.random.uniform(-0.003, 0.003)
+        # 下午价格可能延续上午趋势，增加一个小的趋势偏移
+        trend_bias = 0.001 if np.random.random() > 0.5 else -0.001
+        close_price = current_price * (1 + price_offset + trend_bias)
+        # 最高价=收盘价+0.05%-0.1%，最低价=收盘价-0.05%-0.1%
+        high_price = close_price * (1 + np.random.uniform(0.0005, 0.001))
+        low_price = close_price * (1 - np.random.uniform(0.0005, 0.001))
+        # 生成成交量（下午时段成交量略低于上午）
+        volume = int(np.random.uniform(6000, 20000))
+        # 添加到数据列表
+        minute_data.append({
+            "time": current_time.strftime("%H:%M"),
+            "high": round(high_price, 4),
+            "low": round(low_price, 4),
+            "close": round(close_price, 4),
+            "volume": volume
+        })
+        # 时间递增指定分钟数
+        current_time += timedelta(minutes=interval)
+        # 确保不超过下午结束时间
+        if current_time > end_afternoon:
+            break
+    
     return minute_data
 
 
 if __name__ == "__main__":
-    # 修复Streamlit标签页切换问题（提前定义标签页顺序）
-    st_pages = ["📅 分钟级数据", "📈 网格策略", "📊 回测结果"]
     main()
