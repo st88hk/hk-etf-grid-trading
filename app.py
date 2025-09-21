@@ -291,7 +291,7 @@ def render_sidebar():
     st.sidebar.header("2. 手续费 & 滑点（可配置）")
     cfg = {
         "platform_fee": st.sidebar.number_input("平台费（每笔，港元）", min_value=0.0, value=15.0, step=1.0),
-        "trade_fee_pct": st.sidebar.number_input("交易佣金（%）", min_value=0.0, value=0.00565, step=0.00001),
+        "trade_fee_pct": st.sidebar.number_input("交易费（%）", min_value=0.0, value=0.00565, step=0.00001),
         "settlement_fee_pct": st.sidebar.number_input("交收费（%）", min_value=0.0, value=0.0042, step=0.00001),
         "sfc_fee_pct": st.sidebar.number_input("证监会费（%）", min_value=0.0, value=0.0027, step=0.00001),
         "frc_fee_pct": st.sidebar.number_input("FRC费（%）", min_value=0.0, value=0.00015, step=0.00001),
@@ -520,3 +520,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
