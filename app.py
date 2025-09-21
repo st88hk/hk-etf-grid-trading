@@ -1,911 +1,521 @@
+# app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from bisect import bisect_left, bisect_right
 
-# 页面配置（适配香港股市日内交易场景）
-st.set_page_config(
-    page_title="香港股市日内T+0网格交易工具",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# --------------------------
-# 1. 核心工具函数（日内交易适配）
-# --------------------------
+# ---------------------------
+# Helpers / Indicators / Cost
+# ---------------------------
 def parse_volume(volume_input):
-    """解析成交量（支持万/亿/k/m单位，适配日内分钟级数据）"""
-    if not volume_input or str(volume_input).strip() == "":
-        return 0
-            
-    volume_input = str(volume_input).strip().lower()
-    multipliers = {
-        'k': 1000,          # 千
-        'w': 10000,         # 万
-        '万': 10000,        # 中文万
-        'm': 1000000,       # 百万
-        '兆': 1000000,      # 中文百万
-        '亿': 100000000     # 亿
-    }
-    
-    # 提取单位和数值
-    unit = None
-    for u in multipliers:
-        if volume_input.endswith(u):
-            unit = u
-            num_str = volume_input[:-len(u)].strip()
-            break
-    if not unit:
-        num_str = volume_input
-    
-    try:
-        num = float(num_str)
-        return int(round(num * multipliers.get(unit, 1)))
-    except (ValueError, TypeError):
-        return 0
-
-
-def calculate_trade_cost(trade_amount, slippage=0.15, is_single_side=True):
-    """计算日内交易成本（含滑点，适配高频交易）
-    :param slippage: 滑点率（默认0.15%，日内高频典型值）
-    :param is_single_side: 是否单边交易（买入/卖出单独计算）
+    """解析成交量（支持 k, m, w, 万, 亿 等）。
+    注意：中文“兆”语义不统一，避免使用；若使用请明确单位含义。
     """
-    # 滑点成本：买入价+滑点，卖出价-滑点
-    slippage_cost = trade_amount * (slippage / 100)
-    
-    # 香港ETF手续费（日内高频场景，平台费每笔15港元）
-    PLATFORM_FEE = 15  # 每笔固定平台费
-    TRADE_FEE_RATE = 0.00565 / 100  # 交易佣金
-    SETTLEMENT_FEE_RATE = 0.0042 / 100  # 交收费
-    SFC_FEE_RATE = 0.0027 / 100  # 证监会费
-    FRC_FEE_RATE = 0.00015 / 100  # 财务汇报局费
-    STAMP_DUTY_RATE = 0  # ETF豁免印花税
+    if volume_input is None:
+        return 0
+    s = str(volume_input).strip().lower()
+    if s == "":
+        return 0
+    multipliers = {
+        'k': 1_000,
+        'm': 1_000_000,
+        'w': 10_000,
+        '万': 10_000,
+        '亿': 100_000_000
+        # 不再默认映射 '兆'，以避免混淆
+    }
+    # 支持带逗号或空格
+    s = s.replace(",", "").replace(" ", "")
+    unit = None
+    number_part = s
+    for u in multipliers:
+        if s.endswith(u):
+            unit = u
+            number_part = s[:-len(u)]
+            break
+    try:
+        num = float(number_part)
+    except Exception:
+        return 0
+    return int(round(num * multipliers.get(unit, 1)))
 
-    # 计算各项费用
-    trade_fee = trade_amount * TRADE_FEE_RATE
-    settlement_fee = trade_amount * SETTLEMENT_FEE_RATE
-    sfc_fee = trade_amount * SFC_FEE_RATE
-    frc_fee = trade_amount * FRC_FEE_RATE
 
-    # 单边总成本（含滑点）
-    single_side_total = (PLATFORM_FEE + trade_fee + settlement_fee + 
-                        sfc_fee + frc_fee + slippage_cost)
-    
-    # 双边交易（买入+卖出）总成本
+def calculate_trade_cost_simple(amount, cfg, is_single_side=True):
+    """计算成本，cfg 是字典包含费率与固定费"""
+    # 滑点：按百分比（如 0.15 表示 0.15%）
+    slippage_cost = amount * (cfg["slippage_pct"] / 100)
+    trade_fee = amount * (cfg["trade_fee_pct"] / 100)
+    settlement_fee = amount * (cfg["settlement_fee_pct"] / 100)
+    sfc_fee = amount * (cfg["sfc_fee_pct"] / 100)
+    frc_fee = amount * (cfg["frc_fee_pct"] / 100)
+    platform_fee = cfg["platform_fee"]  # 每笔固定
+    single_total = platform_fee + trade_fee + settlement_fee + sfc_fee + frc_fee + slippage_cost
     if not is_single_side:
-        return round(single_side_total * 2, 2)
-    return round(single_side_total, 2)
+        # 买+卖 两边费用（平台费两次）
+        return round(single_total * 2, 2)
+    return round(single_total, 2)
 
 
 def calculate_atr(highs, lows, closes, period=14):
-    """计算平均真实波幅（ATR），用于动态网格间距"""
-    atr_data = []
-    for i in range(len(closes)):
-        if i == 0:
-            tr = highs[i] - lows[i]  # 首日TR=最高价-最低价
-        else:
-            # TR = max(最高价-最低价, |最高价-前收盘价|, |最低价-前收盘价|)
-            tr1 = highs[i] - lows[i]
-            tr2 = abs(highs[i] - closes[i-1])
-            tr3 = abs(lows[i] - closes[i-1])
-            tr = max(tr1, tr2, tr3)
-        atr_data.append(tr)
-    
-    # 计算ATR（滚动平均）
-    atr = []
-    for i in range(len(atr_data)):
-        if i < period - 1:
-            atr.append(None)  # 数据不足时返回None
-        else:
-            atr_val = np.mean(atr_data[i-period+1:i+1])
-            atr.append(round(atr_val, 4))
+    highs = np.array(highs)
+    lows = np.array(lows)
+    closes = np.array(closes)
+    tr = np.maximum(highs - lows, np.maximum(np.abs(highs - np.concatenate(([closes[0]], closes[:-1]))),
+                                            np.abs(lows - np.concatenate(([closes[0]], closes[:-1])))))
+    atr = pd.Series(tr).rolling(window=period, min_periods=1).mean().round(6).tolist()
+    # pad with None for first (period-1) if desired: but returning full list is fine
     return atr
 
 
-def calculate_intraday_kdj(highs, lows, closes, k_period=6, d_period=2):
-    """计算日内专用KDJ（参数6,2,2，比默认更灵敏）"""
-    kdj = []
-    for i in range(len(closes)):
-        if i < k_period - 1:
-            kdj.append((None, None, None))  # 数据不足
-        else:
-            # 计算RSV（未成熟随机值）
-            recent_high = max(highs[i - k_period + 1:i + 1])
-            recent_low = min(lows[i - k_period + 1:i + 1])
-            rsv = (closes[i] - recent_low) / (recent_high - recent_low) * 100 if recent_high != recent_low else 50
-            
-            # 计算K值（平滑RSV）
-            if i == k_period - 1:
-                k = rsv  # 初始K值=RSV
-            else:
-                prev_k = kdj[i-1][0]
-                k = (2/3) * prev_k + (1/3) * rsv
-            
-            # 计算D值（平滑K值）
-            if i == k_period - 1:
-                d = k  # 初始D值=K值
-            else:
-                prev_d = kdj[i-1][1]
-                d = (2/3) * prev_d + (1/3) * k
-            
-            j = 3 * k - 2 * d  # J值（反应最快）
-            kdj.append((round(k, 2), round(d, 2), round(j, 2)))
-    return kdj
-
-
 def calculate_narrow_bollinger(prices, period=10, num_std=1.5):
-    """计算窄幅布林带（日内专用：周期10，标准差1.5，比默认更灵敏）"""
-    middle_band = []  # 中轨（MA）
-    upper_band = []   # 上轨（MA + 1.5*std）
-    lower_band = []   # 下轨（MA - 1.5*std）
-    
-    for i in range(len(prices)):
-        if i < period - 1:
-            middle_band.append(None)
-            upper_band.append(None)
-            lower_band.append(None)
-        else:
-            # 计算中轨（移动平均）
-            ma = np.mean(prices[i-period+1:i+1])
-            # 计算标准差
-            std = np.std(prices[i-period+1:i+1])
-            # 计算上下轨
-            upper = ma + num_std * std
-            lower = ma - num_std * std
-            # 保留4位小数（日内价格波动小）
-            middle_band.append(round(ma, 4))
-            upper_band.append(round(upper, 4))
-            lower_band.append(round(lower, 4))
-    return upper_band, middle_band, lower_band
+    s = pd.Series(prices)
+    ma = s.rolling(period, min_periods=1).mean()
+    std = s.rolling(period, min_periods=1).std().fillna(0)
+    upper = (ma + num_std * std).round(6).tolist()
+    mid = ma.round(6).tolist()
+    lower = (ma - num_std * std).round(6).tolist()
+    return upper, mid, lower
 
 
-# --------------------------
-# 2. 网格策略核心逻辑（日内T+0适配）
-# --------------------------
-def calculate_dynamic_grid_params(principal, current_price, minute_data, 
-                                 grid_count=15, atr_period=14, kdj_period=6):
+# ---------------------------
+# Grid generation (等距)
+# ---------------------------
+def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, grid_upper, grid_lower):
+    """等距网格：每格 = current_price * spacing_pct%
+    grid_count 为总档数（买+卖）
+    返回：buy_grids(升序低->高), sell_grids(升序低->高)
     """
-    计算日内动态网格参数（基于ATR和KDJ）
-    :param grid_count: 网格总档数（默认15档，日内高频建议10-20档）
-    :param atr_period: ATR计算周期（默认14，日内常用10-15）
-    :return: 优化后的网格参数
+    spacing = spacing_pct / 100.0
+    half = grid_count // 2
+    # 买入：current_price - spacing, current_price - 2*spacing ...
+    buy = [round(current_price * (1 - spacing * (i + 1)), 4) for i in range(half)]
+    sell = [round(current_price * (1 + spacing * (i + 1)), 4) for i in range(half)]
+    # 过滤区间
+    buy = [p for p in buy if p >= grid_lower * 0.99]
+    sell = [p for p in sell if p <= grid_upper * 1.01]
+    buy.sort()   # 升序（低->高）
+    sell.sort()  # 升序（低->高）
+    return buy, sell
+
+
+# ---------------------------
+# 回测：更真实的触发与净值曲线
+# ---------------------------
+def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sell_grids, minute_data, cfg):
     """
-    # 提取分钟级数据
-    highs = [d['high'] for d in minute_data if d['high'] > 0]
-    lows = [d['low'] for d in minute_data if d['low'] > 0]
-    closes = [d['close'] for d in minute_data if d['close'] > 0]
-    if len(closes) < max(atr_period, kdj_period):
-        st.warning("数据不足，使用默认网格参数")
-        return get_default_grid_params(principal, current_price, grid_count)
-    
-    # 1. 计算核心指标
-    atr = calculate_atr(highs, lows, closes, atr_period)
-    latest_atr = atr[-1] if atr[-1] is not None else (max(highs[-5:]) - min(lows[-5:])) / 2
-    kdj = calculate_intraday_kdj(highs, lows, closes, kdj_period)
-    latest_k, latest_d, _ = kdj[-1] if kdj[-1][0] is not None else (50, 50, 50)
-    bollinger_upper, bollinger_mid, bollinger_lower = calculate_narrow_bollinger(closes)
-    latest_bollinger_upper = bollinger_upper[-1] if bollinger_upper[-1] is not None else current_price * 1.01
-    latest_bollinger_lower = bollinger_lower[-1] if bollinger_lower[-1] is not None else current_price * 0.99
+    更真实的回测：
+    - 同一分钟内可以多次触发多个档位（price range within minute)
+    - 每分钟以当分钟 close 做净值估值并记录
+    - 使用 shares per lot (100) 做整数手约束
+    """
+    trade_records = []
+    cash = principal * cfg.get("initial_cash_pct", 0.5)
+    shares = 0
+    shares_per_lot = cfg.get("shares_per_lot", 100)
+    single_trade_amount = cfg.get("single_trade_amount", principal * 0.05)
 
-    # 2. 动态网格区间（基于布林带，适配日内窄幅波动）
-    grid_upper = latest_bollinger_upper * 1.005  # 上轨+0.5%缓冲
-    grid_lower = latest_bollinger_lower * 0.995  # 下轨-0.5%缓冲
-    # 确保区间不超过日内最大波动（默认±2%，可调整）
-    grid_upper = min(grid_upper, current_price * 1.02)
-    grid_lower = max(grid_lower, current_price * 0.98)
+    # Make copies and keep them sorted
+    buy_list = sorted(buy_grids)   # ascending (low->high)
+    sell_list = sorted(sell_grids) # ascending (low->high)
 
-    # 3. 动态网格间距（基于ATR，确保日内触发频率）
-    # 间距=ATR*0.6/当前价格（0.6为系数，越小间距越密，需>成本占比）
-    base_spacing_pct = (latest_atr * 0.6 / current_price) * 100
-    # 计算最小安全间距（覆盖双边成本，避免亏损）
-    single_trade_amount = (principal * 0.05)  # 单次交易金额（本金5%，日内风控）
-    round_trip_cost = calculate_trade_cost(single_trade_amount, is_single_side=False)
-    min_safe_spacing_pct = (round_trip_cost / single_trade_amount) * 100 * 1.2  # 加20%安全垫
-    # 最终间距：取动态间距和最小安全间距的较大值
-    final_spacing_pct = max(base_spacing_pct, min_safe_spacing_pct, 0.2)  # 最小0.2%，避免过密
+    net_values = []
+    timestamps = []
+    holdings_history = []
 
-    # 4. 网格档数调整（基于KDJ超买超卖）
-    final_grid_count = grid_count
-    if latest_k > 75:  # 超买区，减少卖出档
-        final_grid_count = max(10, grid_count - 3)
-    elif latest_k < 25:  # 超卖区，减少买入档
-        final_grid_count = max(10, grid_count - 3)
-    # 确保档数为偶数（买入档=卖出档）
-    final_grid_count = final_grid_count if final_grid_count % 2 == 0 else final_grid_count + 1
+    for row in minute_data:
+        t = row["time"]
+        high = row["high"]
+        low = row["low"]
+        close = row["close"]
 
-    return {
-        "trend_status": "震荡" if latest_k > 30 and latest_k < 70 else "弱趋势",
-        "kdj": (latest_k, latest_d),
-        "atr": latest_atr,
-        "grid_upper": round(grid_upper, 4),
-        "grid_lower": round(grid_lower, 4),
-        "spacing_pct": round(final_spacing_pct, 3),
-        "grid_count": final_grid_count,
-        "single_trade_amount": round(single_trade_amount, 2),
-        "round_trip_cost": round_trip_cost
-    }
+        # BUY: while there exists buy_price >= low and buy_price <= high? For buy we trigger when price <= buy_price
+        # Since buy_list sorted low->high, we should process from lowest (most attractive)
+        triggered = True
+        while triggered:
+            triggered = False
+            # find all buy prices where low <= price <= high (price reached in this minute)
+            # for intraday granularity, if low <= buy_price (we treat it as triggered)
+            if buy_list:
+                # find leftmost index where buy_price >= low
+                # iterate from smallest to largest and pick first that is >= low and <= close? we allow low trigger
+                for bp in buy_list:
+                    if low <= bp:
+                        # Can buy if have enough cash
+                        max_lots_by_amount = int((single_trade_amount / bp) // shares_per_lot)
+                        max_lots_by_cash = int(cash // (bp * shares_per_lot))
+                        lots = min(max_lots_by_amount, max_lots_by_cash)
+                        if lots <= 0:
+                            # can't afford this buy
+                            continue
+                        buy_shares = lots * shares_per_lot
+                        buy_amount = buy_shares * bp
+                        cost = calculate_trade_cost_simple(buy_amount, cfg, is_single_side=True)
+                        # execute
+                        shares += buy_shares
+                        cash -= (buy_amount + cost)
+                        trade_records.append({
+                            "时间": t,
+                            "类型": "买入",
+                            "价格(港元)": bp,
+                            "股数": buy_shares,
+                            "金额(港元)": round(buy_amount, 2),
+                            "成本(港元)": round(cost, 2),
+                            "剩余现金(港元)": round(cash, 2),
+                            "持仓股数": shares
+                        })
+                        buy_list.remove(bp)
+                        triggered = True
+                        break  # 重新检查（因为列表改变）
+            # SELL: while there exists sell_price <= high
+            if sell_list:
+                # since sell_list ascending, find any sell price <= high; better to sell highest first to realize max profit
+                for sp in reversed(sell_list):
+                    if high >= sp and shares >= shares_per_lot:
+                        # determine how many lots to sell (bounded by single_trade_amount and current shares)
+                        max_lots_by_amount = int((single_trade_amount / sp) // shares_per_lot)
+                        max_lots_by_shares = int(shares // shares_per_lot)
+                        lots = min(max_lots_by_amount, max_lots_by_shares)
+                        if lots <= 0:
+                            continue
+                        sell_shares = lots * shares_per_lot
+                        sell_amount = sell_shares * sp
+                        cost = calculate_trade_cost_simple(sell_amount, cfg, is_single_side=True)
+                        # execute
+                        shares -= sell_shares
+                        cash += (sell_amount - cost)
+                        trade_records.append({
+                            "时间": t,
+                            "类型": "卖出",
+                            "价格(港元)": sp,
+                            "股数": sell_shares,
+                            "金额(港元)": round(sell_amount, 2),
+                            "成本(港元)": round(cost, 2),
+                            "剩余现金(港元)": round(cash, 2),
+                            "持仓股数": shares
+                        })
+                        sell_list.remove(sp)
+                        triggered = True
+                        break  # 重新检查
 
+        # 每分钟记录净值（用当分钟 close 来估值）
+        holdings_value = shares * close
+        net_value = cash + holdings_value
+        timestamps.append(t)
+        net_values.append(net_value)
+        holdings_history.append(shares)
 
-def get_default_grid_params(principal, current_price, grid_count=15):
-    """默认网格参数（数据不足时使用）"""
-    # 固定区间：当前价格±1.5%（日内典型波动）
-    grid_upper = current_price * 1.015
-    grid_lower = current_price * 0.985
-    # 固定间距：0.3%（日内常用）
-    spacing_pct = 0.3
-    # 单次交易金额：本金5%
-    single_trade_amount = principal * 0.05
-    round_trip_cost = calculate_trade_cost(single_trade_amount, is_single_side=False)
-    
-    return {
-        "trend_status": "默认模式",
-        "kdj": (50, 50),
-        "atr": (current_price * 0.01) / 2,  # 估算ATR
-        "grid_upper": round(grid_upper, 4),
-        "grid_lower": round(grid_lower, 4),
-        "spacing_pct": spacing_pct,
-        "grid_count": grid_count if grid_count % 2 == 0 else grid_count + 1,
-        "single_trade_amount": round(single_trade_amount, 2),
-        "round_trip_cost": round_trip_cost
-    }
+    final_total = net_values[-1] if net_values else (cash + shares * current_price)
+    total_profit = final_total - principal
+    profit_rate = (total_profit / principal) * 100 if principal != 0 else 0
 
-
-def generate_intraday_grid(current_price, spacing_pct, grid_count, grid_upper, grid_lower):
-    """生成日内网格（买入档=卖出档，适配高频交易）"""
-    spacing = spacing_pct / 100  # 间距百分比转小数
-    buy_grids = []  # 买入价（低于当前价）
-    sell_grids = []  # 卖出价（高于当前价）
-
-    # 生成买入档（从当前价向下，每次减间距）
-    current_buy = current_price * (1 - spacing)
-    for _ in range(grid_count // 2):
-        if current_buy < grid_lower * 0.99:  # 不低于下轨-1%
-            break
-        buy_grids.append(round(current_buy, 4))
-        current_buy *= (1 - spacing)
-    # 买入档倒序（低价在前，便于触发）
-    buy_grids = sorted(buy_grids, reverse=True)
-
-    # 生成卖出档（从当前价向上，每次加间距）
-    current_sell = current_price * (1 + spacing)
-    for _ in range(grid_count // 2):
-        if current_sell > grid_upper * 1.01:  # 不高于上轨+1%
-            break
-        sell_grids.append(round(current_sell, 4))
-        current_sell *= (1 + spacing)
-    # 卖出档正序（高价在后，便于触发）
-    sell_grids = sorted(sell_grids)
-
-    return buy_grids, sell_grids
-
-
-def backtest_intraday_strategy(principal, current_price, buy_grids, sell_grids, minute_data):
-    """日内策略回测（基于分钟级数据）"""
-    trade_records = []  # 交易记录
-    total_cash = principal * 0.5  # 初始现金（50%仓位，日内风控）
-    total_shares = 0  # 初始持股
-    shares_per_lot = 100  # 港股每手100股
-    single_trade_amount = (principal * 0.05)  # 单次交易金额
-
-    # 遍历分钟级数据，模拟交易
-    for idx, data in enumerate(minute_data):
-        time = data['time']
-        high = data['high']
-        low = data['low']
-        close = data['close']
-        volume = data['volume']
-
-        # 1. 检查买入触发（价格跌破买入档）
-        for buy_price in buy_grids:
-            if low <= buy_price and total_cash >= single_trade_amount:
-                # 计算可买股数（按100股整数倍）
-                buy_shares = int((single_trade_amount / buy_price) // shares_per_lot * shares_per_lot)
-                if buy_shares == 0:
-                    continue
-                # 计算实际成本（含滑点）
-                buy_amount = buy_shares * buy_price
-                cost = calculate_trade_cost(buy_amount, is_single_side=True)
-                # 更新仓位和现金
-                total_shares += buy_shares
-                total_cash -= (buy_amount + cost)
-                # 记录交易
-                trade_records.append({
-                    "时间": time,
-                    "类型": "买入",
-                    "价格(港元)": buy_price,
-                    "股数": buy_shares,
-                    "金额(港元)": round(buy_amount, 2),
-                    "成本(港元)": round(cost, 2),
-                    "剩余现金(港元)": round(total_cash, 2),
-                    "持仓股数": total_shares
-                })
-                # 触发后移除该买入档（避免重复触发）
-                buy_grids.remove(buy_price)
-                break
-
-        # 2. 检查卖出触发（价格突破卖出档）
-        for sell_price in sell_grids:
-            if high >= sell_price and total_shares >= shares_per_lot:
-                # 计算可卖股数（按100股整数倍）
-                sell_shares = min(int(total_shares // shares_per_lot * shares_per_lot), 
-                                 int(single_trade_amount / sell_price) // shares_per_lot * shares_per_lot)
-                if sell_shares == 0:
-                    continue
-                # 计算实际收益（含滑点）
-                sell_amount = sell_shares * sell_price
-                cost = calculate_trade_cost(sell_amount, is_single_side=True)
-                # 更新仓位和现金
-                total_shares -= sell_shares
-                total_cash += (sell_amount - cost)
-                # 记录交易
-                trade_records.append({
-                    "时间": time,
-                    "类型": "卖出",
-                    "价格(港元)": sell_price,
-                    "股数": sell_shares,
-                    "金额(港元)": round(sell_amount, 2),
-                    "成本(港元)": round(cost, 2),
-                    "剩余现金(港元)": round(total_cash, 2),
-                    "持仓股数": total_shares
-                })
-                # 触发后移除该卖出档（避免重复触发）
-                sell_grids.remove(sell_price)
-                break
-
-    # 3. 回测结果计算
-    # 最终市值（现金+持仓价值）
-    final_holdings_value = total_shares * current_price
-    final_total_value = total_cash + final_holdings_value
-    # 总收益和收益率
-    total_profit = final_total_value - principal
-    profit_rate = (total_profit / principal) * 100
-    # 交易统计
-    total_buy_count = len([r for r in trade_records if r["类型"] == "买入"])
-    total_sell_count = len([r for r in trade_records if r["类型"] == "卖出"])
+    # 统计
+    buys = [r for r in trade_records if r["类型"] == "买入"]
+    sells = [r for r in trade_records if r["类型"] == "卖出"]
+    total_buy_count = len(buys)
+    total_sell_count = len(sells)
     avg_trade_profit = (total_profit / (total_buy_count + total_sell_count)) if (total_buy_count + total_sell_count) > 0 else 0
+
+    # 最大回撤按净值序列计算
+    max_drawdown = calculate_max_drawdown_from_series(net_values)
 
     return {
         "trade_records": trade_records,
-        "final_total_value": round(final_total_value, 2),
+        "final_total_value": round(final_total, 2),
         "total_profit": round(total_profit, 2),
         "profit_rate": round(profit_rate, 4),
         "total_buy_count": total_buy_count,
         "total_sell_count": total_sell_count,
         "avg_trade_profit": round(avg_trade_profit, 2),
-        "max_drawdown": calculate_max_drawdown(trade_records, principal)  # 计算最大回撤
+        "max_drawdown": max_drawdown,
+        "net_values": net_values,
+        "timestamps": timestamps,
+        "holdings_history": holdings_history
     }
 
 
-def calculate_max_drawdown(trade_records, principal):
-    """计算日内最大回撤（风控关键指标）"""
-    if not trade_records:
+def calculate_max_drawdown_from_series(net_values):
+    if not net_values:
         return 0.0
-    # 记录每日净值变化
-    net_values = [principal]
-    for record in trade_records:
-        # 净值=剩余现金+持仓价值（假设持仓按当前交易价计算）
-        holdings_value = record["持仓股数"] * record["价格(港元)"]
-        net_value = record["剩余现金(港元)"] + holdings_value
-        net_values.append(net_value)
-    # 计算最大回撤：(峰值-谷值)/峰值
-    peak = max(net_values)
-    trough = min(net_values[net_values.index(peak):])  # 峰值后的谷值
-    max_drawdown = ((peak - trough) / peak) * 100
-    return round(max_drawdown, 4)
+    series = pd.Series(net_values)
+    running_max = series.cummax()
+    drawdown = (running_max - series) / running_max
+    max_dd = drawdown.max() * 100  # in %
+    return round(float(max_dd), 4)
 
 
-# --------------------------
-# 3. Streamlit界面（香港股市日内交易专用）
-# --------------------------
-def main():
-    st.title("香港股市日内T+0网格交易策略工具")
-    st.write("🔍 适配香港股市交易时间（09:30-12:00，13:00-16:00），支持动态网格间距")
-    st.divider()
-
-    # 初始化会话状态（保存数据和参数）
-    if "minute_data" not in st.session_state:
-        # 生成默认分钟级数据（符合香港股市交易时间）
-        st.session_state.minute_data = generate_default_minute_data()
-    if "grid_params" not in st.session_state:
-        st.session_state.grid_params = None
-    if "backtest_result" not in st.session_state:
-        st.session_state.backtest_result = None
-
-    # 侧边栏：参数设置（日内交易专用）
-    with st.sidebar:
-        st.header("1. 基础交易参数")
-        # 本金设置（日内建议1-5万港元，控制风险）
-        principal = st.number_input(
-            "交易本金（港元）",
-            min_value=10000.0,
-            max_value=100000.0,
-            value=30000.0,
-            step=5000.0,
-            help="日内交易建议1-5万，单次交易不超过本金5%"
-        )
-        # 交易标的（ETF代码）
-        etf_code = st.text_input(
-            "ETF代码（港股）",
-            value="02800.HK",  # 恒生ETF示例
-            help="选择日均成交额>5亿、波动率0.5%-1.5%的ETF"
-        )
-        # 当前价格
-        current_price = st.number_input(
-            f"{etf_code}当前价格（港元）",
-            min_value=0.01,
-            value=27.5,
-            step=0.01,
-            format="%.4f",  # 保留4位小数，适配日内小波动
-            help="输入最新成交价，精确到0.0001港元"
-        )
-
-        st.divider()
-        st.header("2. 日内网格参数")
-        # 网格类型（动态/固定）
-        grid_type = st.radio(
-            "网格类型",
-            ["动态间距（推荐）", "固定间距"],
-            index=0,
-            help="动态间距：基于ATR自动适配波动；固定间距：手动设置"
-        )
-        # 分钟级数据周期（默认5分钟，日内高频常用）
-        data_interval = st.selectbox(
-            "数据周期",
-            [1, 5, 10, 15],
-            index=1,
-            help="1分钟：超高频；5分钟：平衡型（推荐）；10-15分钟：低频"
-        )
-        # 网格档数（默认15档）
-        grid_count = st.slider(
-            "网格总档数（买入档=卖出档）",
-            min_value=10,
-            max_value=25,
-            value=15,
-            step=1,
-            help="日内建议10-20档，档数越多触发越频繁"
-        )
-        # 固定间距（仅固定模式显示）
-        fixed_spacing_pct = 0.3
-        if grid_type == "固定间距":
-            fixed_spacing_pct = st.slider(
-                "固定网格间距（%）",
-                min_value=0.1,
-                max_value=1.0,
-                value=0.3,
-                step=0.05,
-                format="%.2f%%",
-                help="日内建议0.2%-0.5%，需>双边成本占比"
-            )
-
-        st.divider()
-        # 操作按钮
-        col_calc, col_reset = st.columns(2)
-        with col_calc:
-            calculate_btn = st.button(
-                "📊 计算网格策略",
-                use_container_width=True,
-                type="primary",
-                help="基于输入数据计算网格参数并回测"
-            )
-        with col_reset:
-            reset_btn = st.button(
-                "🔄 重置数据",
-                use_container_width=True,
-                help="重置为默认分钟级数据和参数"
-            )
-            if reset_btn:
-                st.session_state.minute_data = generate_default_minute_data()
-                st.session_state.grid_params = None
-                st.session_state.backtest_result = None
-                st.success("数据已重置为默认值")
-
-    # 主界面：分标签页
-    tab1, tab2, tab3 = st.tabs(["📅 分钟级数据", "📈 网格策略", "📊 回测结果"])
-
-    # 标签页1：分钟级数据输入（已适配香港交易时间）
-    with tab1:
-        st.subheader(f"日内{data_interval}分钟数据（香港交易时间：09:30-12:00，13:00-16:00）")
-        st.write("💡 提示：表格已自动过滤午休时间（12:00-13:00），成交量支持1000、1k、0.1万等格式")
-        
-        # 生成表格数据（字典列表，确保列名对应）
-        table_data = []
-        for data in st.session_state.minute_data:
-            # 格式化成交量（万为单位，便于查看）
-            vol = data['volume']
-            if vol >= 10000:
-                vol_str = f"{vol/10000:.2f}万"
-            elif vol >= 1000:
-                vol_str = f"{vol/1000:.1f}k"
-            else:
-                vol_str = str(vol)
-            table_data.append({
-                "时间": data['time'],
-                "最高价(港元)": data['high'],
-                "最低价(港元)": data['low'],
-                "收盘价(港元)": data['close'],
-                "成交量": vol_str
-            })
-
-        # 可编辑表格
-        edited_table = st.data_editor(
-            table_data,
-            column_config={
-                "时间": st.column_config.TextColumn(disabled=False, help="格式：HH:MM，如09:30（仅支持09:30-12:00和13:00-16:00）"),
-                "最高价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
-                "最低价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
-                "收盘价(港元)": st.column_config.NumberColumn(format="%.4f", min_value=0.0001),
-                "成交量": st.column_config.TextColumn(help="支持1000、1k、0.1万等格式")
-            },
-            use_container_width=True,
-            hide_index=True,
-            key="minute_data_editor"
-        )
-
-        # 数据保存按钮
-        if st.button("💾 保存数据", use_container_width=True):
-            try:
-                # 更新分钟级数据到会话状态
-                updated_minute_data = []
-                for idx, row in enumerate(edited_table):
-                    # 解析时间（补全当日日期）
-                    time_str = row["时间"].strip()
-                    if not time_str or len(time_str.split(":")) != 2:
-                        st.warning(f"第{idx+1}行时间格式错误，跳过该条数据")
-                        continue
-                    
-                    # 验证时间是否在香港交易时段内
-                    hour, minute = map(int, time_str.split(":"))
-                    is_valid = False
-                    # 上午时段：09:30-12:00
-                    if (hour == 9 and minute >= 30) or (10 <= hour < 12):
-                        is_valid = True
-                    # 下午时段：13:00-16:00
-                    elif 13 <= hour < 16:
-                        is_valid = True
-                    # 12:00整和16:00整特殊处理
-                    elif (hour == 12 and minute == 0) or (hour == 16 and minute == 0):
-                        is_valid = True
-                    
-                    if not is_valid:
-                        st.warning(f"第{idx+1}行时间不在交易时段内（12:00-13:00为休市时间），已跳过")
-                        continue
-                    
-                    # 解析价格（确保合理）
-                    high = float(row["最高价(港元)"])
-                    low = float(row["最低价(港元)"])
-                    close = float(row["收盘价(港元)"])
-                    if high < low or close < low or close > high:
-                        st.warning(f"第{idx+1}行价格逻辑错误（高价<低价或收盘价超区间），已自动修正")
-                        high = max(high, low, close)
-                        low = min(high, low, close)
-                        close = max(min(close, high), low)
-                    # 解析成交量
-                    volume = parse_volume(row["成交量"])
-                    # 添加到更新列表
-                    updated_minute_data.append({
-                        "time": time_str,
-                        "high": round(high, 4),
-                        "low": round(low, 4),
-                        "close": round(close, 4),
-                        "volume": volume
-                    })
-                # 按时间排序
-                updated_minute_data.sort(key=lambda x: datetime.strptime(x["time"], "%H:%M"))
-                # 保存更新后的数据
-                st.session_state.minute_data = updated_minute_data
-                st.success(f"成功保存{len(updated_minute_data)}条分钟级数据（已过滤休市时间）")
-            except Exception as e:
-                st.error(f"数据保存失败：{str(e)}")
-
-        # 生成默认数据按钮
-        if st.button("🔧 生成默认数据", use_container_width=True):
-            st.session_state.minute_data = generate_default_minute_data(current_price=current_price, interval=data_interval)
-            st.rerun()  # 刷新页面显示新数据
-
-    # 标签页2：网格策略计算结果
-    with tab2:
-        st.subheader("网格策略参数（香港股市日内T+0优化）")
-        st.write("📌 关键指标：动态间距基于ATR，确保日内触发频率；成本已含滑点")
-
-        # 计算按钮触发后显示结果
-        if calculate_btn:
-            try:
-                # 1. 计算网格参数
-                with st.spinner("正在计算网格参数..."):
-                    if grid_type == "动态间距（推荐）":
-                        # 动态网格（基于ATR）
-                        st.session_state.grid_params = calculate_dynamic_grid_params(
-                            principal=principal,
-                            current_price=current_price,
-                            minute_data=st.session_state.minute_data,
-                            grid_count=grid_count
-                        )
-                    else:
-                        # 固定网格（手动设置间距）
-                        grid_params = get_default_grid_params(principal, current_price, grid_count)
-                        grid_params["spacing_pct"] = fixed_spacing_pct
-                        grid_params["trend_status"] = "固定模式"
-                        st.session_state.grid_params = grid_params
-
-                # 2. 生成网格价格
-                grid_params = st.session_state.grid_params
-                buy_grids, sell_grids = generate_intraday_grid(
-                    current_price=current_price,
-                    spacing_pct=grid_params["spacing_pct"],
-                    grid_count=grid_params["grid_count"],
-                    grid_upper=grid_params["grid_upper"],
-                    grid_lower=grid_params["grid_lower"]
-                )
-                # 保存网格到会话状态
-                st.session_state.buy_grids = buy_grids
-                st.session_state.sell_grids = sell_grids
-
-                # 3. 显示策略参数（分栏布局，清晰直观）
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("### 基础配置")
-                    st.write(f"**交易标的**：{etf_code}")
-                    st.write(f"**交易本金**：{principal:,.0f}港元")
-                    st.write(f"**当前价格**：{current_price:.4f}港元")
-                    st.write(f"**数据周期**：{data_interval}分钟")
-                    st.write(f"**网格类型**：{grid_type}")
-
-                with col2:
-                    st.markdown("### 网格核心参数")
-                    st.write(f"**网格区间**：{grid_params['grid_lower']:.4f} ~ {grid_params['grid_upper']:.4f}港元")
-                    st.write(f"**网格间距**：{grid_params['spacing_pct']:.3f}%")
-                    st.write(f"**网格档数**：{grid_params['grid_count']}档（买入{len(buy_grids)}档/卖出{len(sell_grids)}档）")
-                    st.write(f"**单次交易金额**：{grid_params['single_trade_amount']:.2f}港元")
-                    st.write(f"**双边成本**：{grid_params['round_trip_cost']:.2f}港元（{grid_params['round_trip_cost']/grid_params['single_trade_amount']*100:.3f}%）")
-
-                st.divider()
-                col3, col4 = st.columns(2)
-                with col3:
-                    st.markdown("### 市场状态指标")
-                    st.write(f"**趋势判断**：{grid_params['trend_status']}")
-                    st.write(f"**KDJ（K,D）**：({grid_params['kdj'][0]}, {grid_params['kdj'][1]})")
-                    st.write(f"**ATR（平均波幅）**：{grid_params['atr']:.4f}港元")
-                    st.write(f"**触发条件**：价格跌破买入档/突破卖出档")
-
-                with col4:
-                    st.markdown("### 风控参数")
-                    st.write(f"**最大仓位**：≤50%（日内不满仓）")
-                    st.write(f"**单次风险**：≤5%本金（避免黑天鹅）")
-                    st.write(f"**最小间距**：{grid_params['spacing_pct']:.3f}%（覆盖成本）")
-                    st.write(f"**区间限制**：当前价±2%（避免极端行情）")
-
-                st.divider()
-                # 显示买入/卖出网格
-                col_buy, col_sell = st.columns(2)
-                with col_buy:
-                    st.markdown(f"### 买入网格（{len(buy_grids)}档）")
-                    if buy_grids:
-                        buy_df = pd.DataFrame({
-                            "买入档位": [f"买{i+1}" for i in range(len(buy_grids))],
-                            "买入价格(港元)": buy_grids,
-                            "触发条件": ["价格≤该档价格" for _ in buy_grids]
-                        })
-                        st.dataframe(buy_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("未生成买入网格，请检查网格参数")
-
-                with col_sell:
-                    st.markdown(f"### 卖出网格（{len(sell_grids)}档）")
-                    if sell_grids:
-                        sell_df = pd.DataFrame({
-                            "卖出档位": [f"卖{i+1}" for i in range(len(sell_grids))],
-                            "卖出价格(港元)": sell_grids,
-                            "触发条件": ["价格≥该档价格" for _ in sell_grids]
-                        })
-                        st.dataframe(sell_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("未生成卖出网格，请检查网格参数")
-
-                # 回测提示
-                st.divider()
-                if st.button("🚀 开始日内回测", use_container_width=True, type="primary"):
-                    with st.spinner("正在进行日内回测..."):
-                        backtest_result = backtest_intraday_strategy(
-                            principal=principal,
-                            current_price=current_price,
-                            buy_grids=buy_grids.copy(),
-                            sell_grids=sell_grids.copy(),
-                            minute_data=st.session_state.minute_data
-                        )
-                        st.session_state.backtest_result = backtest_result
-                        # 切换到回测结果标签页
-                        # 使用JavaScript实现标签页切换
-                        st.components.v1.html(
-                            f"""
-                            <script>
-                                // 找到第三个标签页并点击
-                                const tabs = window.parent.document.querySelectorAll('[data-testid="stTab"]');
-                                if (tabs.length >= 3) {{
-                                    tabs[2].click();
-                                }}
-                            </script>
-                            """,
-                            height=0,
-                        )
-
-            except Exception as e:
-                st.error(f"策略计算失败：{str(e)}")
-                st.exception(e)  # 显示详细错误信息（调试用）
-
-        # 未点击计算按钮时显示提示
-        elif not st.session_state.grid_params:
-            st.info("请在左侧边栏设置参数后，点击【计算网格策略】按钮")
-        # 已计算过，显示缓存结果
-        else:
-            # 显示参数（同计算后逻辑）
-            grid_params = st.session_state.grid_params
-            buy_grids = st.session_state.get("buy_grids", [])
-            sell_grids = st.session_state.get("sell_grids", [])
-            st.info("已加载历史计算结果，点击【计算网格策略】可更新参数")
-
-    # 标签页3：回测结果
-    with tab3:
-        st.subheader("日内T+0策略回测结果")
-        st.write("📊 基于输入的分钟级数据，模拟日内交易触发情况")
-
-        # 显示回测结果
-        backtest_result = st.session_state.get("backtest_result")
-        if backtest_result:
-            # 1. 核心收益指标
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("初始本金(港元)", f"{principal:,.0f}")
-            with col2:
-                st.metric("最终总市值(港元)", f"{backtest_result['final_total_value']:,.2f}")
-            with col3:
-                profit_color = "green" if backtest_result["total_profit"] > 0 else "red"
-                st.metric("总收益(港元)", f"{backtest_result['total_profit']:,.2f}", 
-                         f"{backtest_result['profit_rate']:.4f}%", delta_color=profit_color)
-            with col4:
-                drawdown_color = "red" if backtest_result["max_drawdown"] > 1 else "orange"
-                st.metric("最大回撤(%)", f"{backtest_result['max_drawdown']:.4f}", 
-                         delta_color=drawdown_color)
-
-            st.divider()
-            # 2. 交易统计
-            col_a, col_b, col_c = st.columns(3)
-            with col_a:
-                st.metric("总买入次数", backtest_result["total_buy_count"])
-            with col_b:
-                st.metric("总卖出次数", backtest_result["total_sell_count"])
-            with col_c:
-                avg_color = "green" if backtest_result["avg_trade_profit"] > 0 else "red"
-                st.metric("平均每笔收益(港元)", f"{backtest_result['avg_trade_profit']:.2f}", 
-                         delta_color=avg_color)
-
-            st.divider()
-            # 3. 交易记录
-            st.markdown("### 详细交易记录")
-            trade_records = backtest_result["trade_records"]
-            if trade_records:
-                # 转换为DataFrame便于查看
-                trade_df = pd.DataFrame(trade_records)
-                # 格式化显示
-                st.dataframe(
-                    trade_df,
-                    column_config={
-                        "时间": st.column_config.TextColumn(),
-                        "类型": st.column_config.TextColumn(),
-                        "价格(港元)": st.column_config.NumberColumn(format="%.4f"),
-                        "股数": st.column_config.NumberColumn(),
-                        "金额(港元)": st.column_config.NumberColumn(format="%.2f"),
-                        "成本(港元)": st.column_config.NumberColumn(format="%.2f"),
-                        "剩余现金(港元)": st.column_config.NumberColumn(format="%.2f"),
-                        "持仓股数": st.column_config.NumberColumn()
-                    },
-                    use_container_width=True,
-                    hide_index=True
-                )
-                # 导出交易记录
-                csv = trade_df.to_csv(index=False, encoding="utf-8-sig")
-                st.download_button(
-                    "💾 下载交易记录",
-                    data=csv,
-                    file_name=f"日内交易记录_{etf_code}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-            else:
-                st.warning("未触发任何交易，可能原因：1.网格间距过大；2.价格未触及网格；3.数据不足")
-
-            st.divider()
-            # 4. 策略建议
-            st.markdown("### 日内交易建议")
-            if backtest_result["profit_rate"] > 0.1:
-                st.success("✅ 策略回测盈利：建议实盘小仓位试错（本金10%以内）")
-            elif backtest_result["profit_rate"] >= 0:
-                st.info("⚠️ 策略回测持平：建议优化网格参数（缩小间距/增加档数）")
-            else:
-                st.error("❌ 策略回测亏损：不建议实盘，需调整参数（如扩大间距/减少档数）")
-            
-            st.write("💡 实盘注意事项：")
-            st.write("1. 注意香港市场交易时段：09:30-12:00和13:00-16:00，午间休市")
-            st.write("2. 收市前30分钟（15:30-16:00）波动较大，可适当扩大网格间距")
-            st.write("3. 单次交易不超过本金5%，总仓位不超过50%")
-            st.write("4. 对接券商API时，需设置条件单有效期为当日")
-
-        else:
-            st.info("请先在【网格策略】标签页计算参数，再点击【开始日内回测】")
-
-    # 底部风险提示
-    st.divider()
-    st.caption("""
-    ⚠️ 风险提示：
-    1. 日内交易风险较高，可能面临滑点扩大、流动性不足等问题
-    2. 回测结果基于历史数据，不代表未来收益
-    3. 实盘前需充分测试，建议从模拟交易开始
-    4. 本工具不构成投资建议，交易风险自负
-    """)
-
-
+# ---------------------------
+# Default minute data generator
+# ---------------------------
 def generate_default_minute_data(current_price=27.5, interval=5):
-    """生成符合香港股市交易时间的默认分钟级数据
-    时间段：09:30-12:00和13:00-16:00，跳过12:00-13:00午休时间
-    """
+    """生成按 interval 分钟的分钟数据，跳过午休"""
     minute_data = []
-    
-    # 上午交易时段：09:30-12:00
-    start_morning = datetime.strptime("09:30", "%H:%M")
-    end_morning = datetime.strptime("12:00", "%H:%M")
-    current_time = start_morning
-    while current_time <= end_morning:
-        # 生成随机价格（围绕当前价±0.3%波动）
+    # Helper to step from start to end inclusive in interval minutes
+    def create_range(start_str, end_str):
+        start = datetime.strptime(start_str, "%H:%M")
+        end = datetime.strptime(end_str, "%H:%M")
+        t = start
+        while t <= end:
+            yield t
+            t += timedelta(minutes=interval)
+
+    for t in create_range("09:30", "12:00"):
         price_offset = np.random.uniform(-0.003, 0.003)
         close_price = current_price * (1 + price_offset)
-        # 最高价=收盘价+0.05%-0.1%，最低价=收盘价-0.05%-0.1%
-        high_price = close_price * (1 + np.random.uniform(0.0005, 0.001))
-        low_price = close_price * (1 - np.random.uniform(0.0005, 0.001))
-        # 生成成交量（上午时段成交量通常较高）
+        high = close_price * (1 + np.random.uniform(0.0005, 0.001))
+        low = close_price * (1 - np.random.uniform(0.0005, 0.001))
         volume = int(np.random.uniform(8000, 25000))
-        # 添加到数据列表
-        minute_data.append({
-            "time": current_time.strftime("%H:%M"),
-            "high": round(high_price, 4),
-            "low": round(low_price, 4),
-            "close": round(close_price, 4),
-            "volume": volume
-        })
-        # 时间递增指定分钟数
-        current_time += timedelta(minutes=interval)
-        # 确保不超过上午结束时间
-        if current_time > end_morning:
-            break
-    
-    # 下午交易时段：13:00-16:00
-    start_afternoon = datetime.strptime("13:00", "%H:%M")
-    end_afternoon = datetime.strptime("16:00", "%H:%M")
-    current_time = start_afternoon
-    while current_time <= end_afternoon:
-        # 生成随机价格（围绕当前价±0.3%波动，下午可能有新趋势）
+        minute_data.append({"time": t.strftime("%H:%M"), "high": round(high, 4), "low": round(low, 4), "close": round(close_price, 4), "volume": volume})
+
+    for t in create_range("13:00", "16:00"):
         price_offset = np.random.uniform(-0.003, 0.003)
-        # 下午价格可能延续上午趋势，增加一个小的趋势偏移
         trend_bias = 0.001 if np.random.random() > 0.5 else -0.001
         close_price = current_price * (1 + price_offset + trend_bias)
-        # 最高价=收盘价+0.05%-0.1%，最低价=收盘价-0.05%-0.1%
-        high_price = close_price * (1 + np.random.uniform(0.0005, 0.001))
-        low_price = close_price * (1 - np.random.uniform(0.0005, 0.001))
-        # 生成成交量（下午时段成交量略低于上午）
+        high = close_price * (1 + np.random.uniform(0.0005, 0.001))
+        low = close_price * (1 - np.random.uniform(0.0005, 0.001))
         volume = int(np.random.uniform(6000, 20000))
-        # 添加到数据列表
-        minute_data.append({
-            "time": current_time.strftime("%H:%M"),
-            "high": round(high_price, 4),
-            "low": round(low_price, 4),
-            "close": round(close_price, 4),
-            "volume": volume
-        })
-        # 时间递增指定分钟数
-        current_time += timedelta(minutes=interval)
-        # 确保不超过下午结束时间
-        if current_time > end_afternoon:
-            break
-    
+        minute_data.append({"time": t.strftime("%H:%M"), "high": round(high, 4), "low": round(low, 4), "close": round(close_price, 4), "volume": volume})
+
     return minute_data
+
+
+# ---------------------------
+# Streamlit UI parts
+# ---------------------------
+def render_sidebar():
+    st.sidebar.header("1. 基础参数")
+    principal = st.sidebar.number_input("交易本金（港元）", min_value=1000.0, max_value=1_000_000.0, value=30_000.0, step=1_000.0)
+    etf_code = st.sidebar.text_input("ETF 代码", value="02800.HK")
+    current_price = st.sidebar.number_input(f"{etf_code} 当前价格（港元）", min_value=0.0001, value=27.5, format="%.4f")
+
+    st.sidebar.header("2. 手续费 & 滑点（可配置）")
+    cfg = {
+        "platform_fee": st.sidebar.number_input("平台费（每笔，港元）", min_value=0.0, value=15.0, step=1.0),
+        "trade_fee_pct": st.sidebar.number_input("交易佣金（%）", min_value=0.0, value=0.00565, step=0.00001),
+        "settlement_fee_pct": st.sidebar.number_input("交收费（%）", min_value=0.0, value=0.0042, step=0.00001),
+        "sfc_fee_pct": st.sidebar.number_input("证监会费（%）", min_value=0.0, value=0.0027, step=0.00001),
+        "frc_fee_pct": st.sidebar.number_input("FRC费（%）", min_value=0.0, value=0.00015, step=0.00001),
+        "slippage_pct": st.sidebar.number_input("滑点（%，每笔估算）", min_value=0.0, value=0.15, step=0.01),
+    }
+    # Convert percent inputs stored as % (e.g. 0.00565) already reflect percent value in your original code — keep user-facing clarity:
+    # The UI expects percent value (like 0.00565) to mean 0.00565% (same as original). We will treat it as percent directly in calculate_trade_cost_simple.
+    st.sidebar.markdown("说明：上面输入的百分比都按“%”填写，例如输入 `0.15` 表示 `0.15%`。")
+
+    st.sidebar.header("3. 网格配置")
+    data_interval = st.sidebar.selectbox("数据周期（分钟）", [1, 5, 10, 15], index=1)
+    grid_type = st.sidebar.radio("网格类型", ["动态间距（基于ATR）", "固定间距（手动）"])
+    grid_count = st.sidebar.slider("网格总档数（买+卖）", 10, 30, 16, 1)
+    fixed_spacing_pct = st.sidebar.slider("固定间距（%）", 0.1, 2.0, 0.3, 0.05) if grid_type != "动态间距（基于ATR）" else None
+
+    st.sidebar.header("4. 回测与仓位")
+    initial_cash_pct = st.sidebar.slider("初始现金占本金比（用于日内可用现金）", 0.1, 1.0, 0.5, 0.05)
+    single_trade_pct = st.sidebar.slider("单次交易金额占本金（%）", 0.5, 20.0, 5.0, 0.5)
+    shares_per_lot = st.sidebar.number_input("每手股数", min_value=1, value=100, step=1)
+
+    cfg.update({
+        "initial_cash_pct": initial_cash_pct,
+        "single_trade_amount": principal * (single_trade_pct / 100.0),
+        "shares_per_lot": int(shares_per_lot)
+    })
+
+    return principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct
+
+
+def render_tab_data():
+    st.subheader("分钟级数据（支持编辑）")
+    if "minute_data" not in st.session_state:
+        st.session_state.minute_data = generate_default_minute_data()
+
+    data_interval = st.session_state.get("data_interval", 5)
+    st.write(f"当前数据周期：{data_interval} 分钟（生成数据用于回测）")
+
+    table = []
+    for d in st.session_state.minute_data:
+        vol_str = f"{d['volume']}" if d['volume'] < 1000 else (f"{d['volume']/1000:.1f}k" if d['volume'] < 10000 else f"{d['volume']/10000:.2f}万")
+        table.append({"时间": d["time"], "最高价(港元)": d["high"], "最低价(港元)": d["low"], "收盘价(港元)": d["close"], "成交量": vol_str})
+
+    edited = st.data_editor(table, use_container_width=True, hide_index=True, key="minute_editor")
+    if st.button("保存数据"):
+        updated = []
+        for idx, row in enumerate(edited):
+            time_str = row["时间"].strip()
+            try:
+                hour, minute = map(int, time_str.split(":"))
+                # 简单时段验证
+                if not ((hour == 9 and minute >= 30) or (10 <= hour < 12) or (hour == 12 and minute == 0) or (13 <= hour < 16) or (hour == 16 and minute == 0)):
+                    st.warning(f"第{idx+1}行时间 {time_str} 可能不在交易时段，已跳过")
+                    continue
+            except:
+                st.warning(f"第{idx+1}行时间格式错误，已跳过")
+                continue
+            try:
+                high = float(row["最高价(港元)"])
+                low = float(row["最低价(港元)"])
+                close = float(row["收盘价(港元)"])
+                if high < low or close < low or close > high:
+                    # 修正
+                    hi = max(high, low, close)
+                    lo = min(high, low, close)
+                    cl = max(min(close, hi), lo)
+                    high, low, close = hi, lo, cl
+                vol = parse_volume(row["成交量"])
+                updated.append({"time": time_str, "high": round(high, 4), "low": round(low, 4), "close": round(close, 4), "volume": vol})
+            except Exception as e:
+                st.warning(f"第{idx+1}行数据解析失败：{e}")
+        # sort by time
+        updated.sort(key=lambda x: datetime.strptime(x["time"], "%H:%M"))
+        st.session_state.minute_data = updated
+        st.success(f"保存 {len(updated)} 条分钟数据")
+
+    if st.button("生成默认数据"):
+        st.session_state.minute_data = generate_default_minute_data()
+        st.success("已生成默认分钟数据")
+
+
+def render_tab_strategy(principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct):
+    st.subheader("网格参数与生成")
+    minute_data = st.session_state.get("minute_data", generate_default_minute_data())
+    highs = [d["high"] for d in minute_data]
+    lows = [d["low"] for d in minute_data]
+    closes = [d["close"] for d in minute_data]
+
+    atr = calculate_atr(highs, lows, closes, period=14)
+    latest_atr = atr[-1] if atr else (max(highs[-5:]) - min(lows[-5:]))/2
+    b_up, b_mid, b_low = calculate_narrow_bollinger(closes, period=10, num_std=1.5)
+    latest_upper = b_up[-1] if b_up else current_price * 1.01
+    latest_lower = b_low[-1] if b_low else current_price * 0.99
+
+    # Dynamic spacing based on ATR (percent)
+    base_spacing_pct = (latest_atr * 0.6 / current_price) * 100
+    # ensure min spacing covers costs
+    single_trade_amount = cfg["single_trade_amount"]
+    round_trip_cost = calculate_trade_cost_simple(single_trade_amount, cfg, is_single_side=False)
+    min_safe_spacing_pct = (round_trip_cost / single_trade_amount) * 100 * 1.2
+    final_spacing_pct = max(base_spacing_pct, min_safe_spacing_pct, 0.2)
+
+    if grid_type != "动态间距（基于ATR）":
+        final_spacing_pct = fixed_spacing_pct
+
+    # bounds
+    grid_upper = min(latest_upper * 1.005, current_price * 1.02)
+    grid_lower = max(latest_lower * 0.995, current_price * 0.98)
+
+    # ensure even grid_count
+    if grid_count % 2 != 0:
+        grid_count += 1
+
+    buy_grids, sell_grids = generate_intraday_grid_arithmetic(current_price, final_spacing_pct, grid_count, grid_upper, grid_lower)
+    st.session_state.update({
+        "grid_params": {
+            "grid_upper": round(grid_upper, 4), "grid_lower": round(grid_lower, 4),
+            "spacing_pct": round(final_spacing_pct, 4), "grid_count": grid_count,
+            "atr": round(latest_atr, 6), "round_trip_cost": round(round_trip_cost, 2),
+            "single_trade_amount": round(single_trade_amount, 2)
+        },
+        "buy_grids": buy_grids,
+        "sell_grids": sell_grids,
+        "data_interval": data_interval
+    })
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### 基础信息")
+        st.write(f"交易标的：{etf_code}")
+        st.write(f"本金：{principal:,.0f} 港元")
+        st.write(f"当前价：{current_price:.4f} 港元")
+    with col2:
+        st.markdown("#### 网格参数")
+        p = st.session_state["grid_params"]
+        st.write(f"区间：{p['grid_lower']} ~ {p['grid_upper']} 港元")
+        st.write(f"间距：{p['spacing_pct']} %")
+        st.write(f"档数：{p['grid_count']} (买{len(buy_grids)} / 卖{len(sell_grids)})")
+        st.write(f"单次交易额：{p['single_trade_amount']} 港元")
+        st.write(f"双边成本：{p['round_trip_cost']} 港元")
+
+    st.divider()
+    col_b, col_s = st.columns(2)
+    with col_b:
+        st.markdown("##### 买入网格")
+        if buy_grids:
+            st.dataframe(pd.DataFrame({"买入档位": [f"买{i+1}" for i in range(len(buy_grids))], "价格(港元)": buy_grids}), use_container_width=True)
+        else:
+            st.warning("未生成买入网格")
+
+    with col_s:
+        st.markdown("##### 卖出网格")
+        if sell_grids:
+            st.dataframe(pd.DataFrame({"卖出档位": [f"卖{i+1}" for i in range(len(sell_grids))], "价格(港元)": sell_grids}), use_container_width=True)
+        else:
+            st.warning("未生成卖出网格")
+
+    if st.button("开始回测"):
+        with st.spinner("回测进行中..."):
+            result = backtest_intraday_strategy_improved(
+                principal=principal,
+                current_price=current_price,
+                buy_grids=buy_grids.copy(),
+                sell_grids=sell_grids.copy(),
+                minute_data=minute_data,
+                cfg=cfg
+            )
+            st.session_state.backtest_result = result
+            st.success("回测完成，切换到回测页查看详情")
+
+
+def render_tab_backtest(principal, etf_code):
+    st.subheader("回测结果")
+    result = st.session_state.get("backtest_result")
+    if not result:
+        st.info("请先生成网格并运行回测")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("初始本金(港元)", f"{principal:,.0f}")
+    col2.metric("最终市值(港元)", f"{result['final_total_value']:,.2f}")
+    col3.metric("总收益(港元)", f"{result['total_profit']:,.2f}", delta=f"{result['profit_rate']:.4f}%")
+    col4.metric("最大回撤(%)", f"{result['max_drawdown']:.4f}%")
+
+    st.divider()
+    st.markdown("### 净值曲线（按分钟）")
+    df_nv = pd.DataFrame({"时间": result["timestamps"], "净值": result["net_values"], "持仓": result["holdings_history"]})
+    df_nv.index = pd.to_datetime(df_nv["时间"], format="%H:%M")
+    st.line_chart(df_nv[["净值"]])
+
+    st.divider()
+    st.markdown("### 交易明细")
+    trades = result["trade_records"]
+    if trades:
+        df_tr = pd.DataFrame(trades)
+        st.dataframe(df_tr, use_container_width=True)
+        csv = df_tr.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("下载交易记录 CSV", data=csv, file_name=f"trade_records_{etf_code}_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv")
+    else:
+        st.info("本次回测未触发任何交易")
+
+    st.divider()
+    # 简单策略建议
+    if result["profit_rate"] > 0.1:
+        st.success("回测结果盈利，建议在模拟盘进一步验证（小仓位实盘）")
+    elif result["profit_rate"] >= 0:
+        st.info("回测持平，考虑优化网格间距或增加档数")
+    else:
+        st.error("回测亏损，建议暂停实盘并回看参数/数据")
+
+
+def main():
+    st.set_page_config(page_title="香港日内网格 T+0（改进版）", layout="wide")
+    st.title("香港股市日内 T+0 网格交易工具 — 改进版")
+    principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct = render_sidebar()
+
+    tabs = st.tabs(["分钟数据", "网格策略", "回测结果"])
+    with tabs[0]:
+        render_tab_data()
+    with tabs[1]:
+        render_tab_strategy(principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct)
+    with tabs[2]:
+        render_tab_backtest(principal, etf_code)
+
+    st.caption("说明：本工具用于策略研究与回测，不构成投资建议。实盘需对接券商 API 并做好风控。")
 
 
 if __name__ == "__main__":
