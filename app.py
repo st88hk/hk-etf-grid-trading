@@ -543,4 +543,126 @@ def render_tab_strategy(principal, etf_code, current_price, cfg, data_interval, 
         st.markdown("#### 网格参数")
         p = st.session_state["grid_params"]
         st.write(f"区间：{p['grid_lower']} ~ {p['grid_upper']} 港元")
-        st.w
+        st.write(f"间距：{p['spacing_pct']} %")
+        st.write(f"档数：{p['grid_count']} (买{len(buy_grids)} / 卖{len(sell_grids)})")
+        st.write(f"单次交易额：{p['single_trade_amount']} 港元")
+        st.write(f"双边成本（估算）：{p['round_trip_cost']} 港元")
+
+    st.divider()
+    st.markdown("##### 买入网格（低->高）")
+    if buy_grids:
+        st.dataframe(pd.DataFrame({"买入档位": [f"买{i+1}" for i in range(len(buy_grids))], "价格(港元)": buy_grids}), use_container_width=True)
+    else:
+        st.warning("未生成买入网格")
+    st.markdown("##### 卖出网格（低->高）")
+    if sell_grids:
+        st.dataframe(pd.DataFrame({"卖出档位": [f"卖{i+1}" for i in range(len(sell_grids))], "价格(港元)": sell_grids}), use_container_width=True)
+    else:
+        st.warning("未生成卖出网格")
+
+    if st.button("开始回测"):
+        with st.spinner("回测进行中..."):
+            result = backtest_intraday_strategy_improved(
+                principal=principal,
+                current_price=current_price,
+                buy_grids=buy_grids.copy(),
+                sell_grids=sell_grids.copy(),
+                minute_data=minute_data,
+                cfg=cfg
+            )
+            st.session_state.backtest_result = result
+            st.success("回测完成，请切换到 回测结果 页查看")
+
+
+def render_tab_backtest(principal, etf_code):
+    st.subheader("回测结果与建议")
+    result = st.session_state.get("backtest_result")
+    if not result:
+        st.info("请先生成网格并运行回测")
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("初始本金(港元)", f"{principal:,.0f}")
+    col2.metric("最终市值(港元)", f"{result['final_total_value']:,.2f}")
+    col3.metric("总收益(港元)", f"{result['total_profit']:,.2f}", delta=f"{result['profit_rate']:.4f}%")
+    col4.metric("最大回撤(%)", f"{result['max_drawdown']:.4f}%")
+
+    st.divider()
+    st.markdown("### 净值曲线（按分钟）")
+    df_nv = pd.DataFrame({"时间": result["timestamps"], "净值": result["net_values"], "持仓": result["holdings_history"]})
+    # 将 index 设为时间（便于画图）
+    try:
+        df_nv.index = pd.to_datetime(df_nv["时间"], format="%H:%M")
+    except:
+        pass
+    st.line_chart(df_nv[["净值"]])
+
+    st.divider()
+    st.markdown("### 交易明细")
+    trades = result["trade_records"]
+    if trades:
+        df_tr = pd.DataFrame(trades)
+        st.dataframe(df_tr, use_container_width=True)
+        csv = df_tr.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button("下载交易记录 CSV", data=csv, file_name=f"trade_records_{etf_code}_{datetime.now().strftime('%Y%m%d')}.csv", mime="text/csv")
+    else:
+        st.info("本次回测未触发任何交易")
+
+    st.divider()
+    # 建议：做一个小范围的间距扫描，看看是否能找到更优间距（轻量）
+    if "grid_params" in st.session_state:
+        cur_spacing = st.session_state["grid_params"]["spacing_pct"]
+        st.markdown("### 网格间距小范围优化建议（轻量扫描）")
+        scan_values = [round(cur_spacing * (1 + delta), 4) for delta in [-0.3, -0.15, 0, 0.15, 0.3]]
+        quick_results = []
+        minute_data = st.session_state.get("minute_data", generate_default_minute_data())
+        buy_base = st.session_state.get("buy_grids", [])
+        sell_base = st.session_state.get("sell_grids", [])
+        # We will regenerate the grids with different spacing but same grid_count and interval
+        grid_count = st.session_state["grid_params"]["grid_count"]
+        grid_upper = st.session_state["grid_params"]["grid_upper"]
+        grid_lower = st.session_state["grid_params"]["grid_lower"]
+        for sp in scan_values:
+            buy_g, sell_g = generate_intraday_grid_arithmetic(st.session_state.get("current_price", 27.5), sp, grid_count, grid_upper, grid_lower)
+            res = backtest_intraday_strategy_improved(principal, st.session_state.get("current_price", 27.5), buy_g.copy(), sell_g.copy(), minute_data, cfg=st.session_state.get("cfg", {}))
+            quick_results.append((sp, res["total_profit"], res["profit_rate"], res["max_drawdown"]))
+
+        qr_df = pd.DataFrame(quick_results, columns=["spacing_pct(%)", "total_profit", "profit_rate(%)", "max_drawdown(%)"])
+        st.dataframe(qr_df, use_container_width=True)
+        best = qr_df.sort_values(by="total_profit", ascending=False).iloc[0]
+        st.markdown(f"建议：在扫描范围内，**最佳间距 = {best['spacing_pct(%)']:.4f}%**，对应总收益 {best['total_profit']:.2f} 港元（仅供参考，建议进一步更细粒度回测）")
+
+    st.divider()
+    st.markdown("### 实盘建议（新手必读）")
+    st.write("""
+    1. **从模拟盘或小仓位开始**：先用 1%〜5% 的资金在实盘验证回测假设。  
+    2. **控制单次风险**：单次下单金额不超过本金的 1%〜5%。  
+    3. **关注成交量与VWAP**：放量时可能出现趋势，网格触发频率和盈亏都会变化。  
+    4. **手续费和滑点敏感**：回测中把滑点设得略保守（大于你预期），可以避免实际亏损比回测严重。  
+    5. **不要盲目加仓**：当出现连续单边行情时（快速下跌或上升），及时停网格并复盘原因。  
+    6. **日志与回放**：保存每次回测参数与交易日志，便于复盘与改进。
+    """)
+    st.caption("免责声明：本工具用于策略研究与回测，不构成投资建议。实盘需做好风控并对接券商 API。")
+
+
+def main():
+    st.set_page_config(page_title="香港日内网格 T+0（新版：滑点推荐+风控）", layout="wide")
+    st.title("香港日内 T+0 网格交易工具（含滑点智能推荐与风控）")
+
+    # Sidebar inputs
+    principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct, avg_daily_turnover = render_sidebar()
+    # Save cfg for use in other pages
+    st.session_state["cfg"] = cfg
+
+    tabs = st.tabs(["分钟数据", "网格策略", "回测结果"])
+    with tabs[0]:
+        render_tab_data()
+    with tabs[1]:
+        render_tab_strategy(principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct, avg_daily_turnover)
+    with tabs[2]:
+        render_tab_backtest(principal, etf_code)
+
+    st.caption("提示：若你完全不懂某个参数，可把鼠标移到输入框的问号查看说明，或在聊天里继续问我具体哪个参数如何设置。")
+
+if __name__ == "__main__":
+    main()
