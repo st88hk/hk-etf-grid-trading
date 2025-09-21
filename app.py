@@ -382,7 +382,7 @@ def render_sidebar():
                                           help="交易中隐藏的成本。若你做挂单可设小一些（例如0.05%），若扫单或流动性差设大一些。")
     if st.sidebar.button("应用推荐滑点"):
         slippage_pct = rec_mid
-        st.experimental_rerun()
+        st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.header("3）网格 & 回测配置（新手说明）")
