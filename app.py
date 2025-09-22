@@ -416,7 +416,7 @@ def generate_default_minute_data(current_price=27.5, interval=5):
 # ---------------------------
 
 def render_sidebar():
-    st.sidebar.header("参数与风控（鼠标悬停查看）")
+    st.sidebar.header("参数与风控")
     principal = st.sidebar.number_input("交易本金（港元）", min_value=1000.0, max_value=5_000_000.0, value=100000.0, step=1000.0)
     etf_code = st.sidebar.text_input("ETF 代码（雅虎财经）", value="2800.HK")
     current_price = st.sidebar.number_input("当前价格（港元）", min_value=0.0001, value=27.5, format="%.4f")
@@ -776,3 +776,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
