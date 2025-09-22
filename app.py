@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -416,7 +415,7 @@ def generate_default_minute_data(current_price=27.5, interval=5):
 # ---------------------------
 
 def render_sidebar():
-    st.sidebar.header("参数与风控")
+    st.sidebar.header("参数与风控（鼠标悬停查看）")
     principal = st.sidebar.number_input("交易本金（港元）", min_value=1000.0, max_value=5_000_000.0, value=100000.0, step=1000.0)
     etf_code = st.sidebar.text_input("ETF 代码（雅虎财经）", value="2800.HK")
     current_price = st.sidebar.number_input("当前价格（港元）", min_value=0.0001, value=27.5, format="%.4f")
@@ -711,12 +710,110 @@ def render_tab_help():
        - 最大持仓不超过本金的50%（单边市风险）
        - 滑点设置参考日均成交额（系统会自动推荐）
     """)
+
+# ---------------------------
+# 新增指标分析函数
+# ---------------------------
+
+def render_tab_indicators():
+    st.subheader("趋势与指标分析")
+    if not st.session_state.get("minute_data"):
+        st.warning("请先在【数据】标签页获取或生成分钟数据")
+        return
     
-   
+    df = pd.DataFrame(st.session_state.minute_data)
+    # 为避免错误，确保有足够的数据点用于计算rolling
+    if 'close' not in df.columns or df['close'].isnull().all():
+        st.warning("当前分钟数据不可用，请先获取有效数据。")
+        return
+
+    df['MA5'] = df['close'].rolling(5, min_periods=1).mean()
+    df['MA20'] = df['close'].rolling(20, min_periods=1).mean()
+    vwap = calculate_vwap(st.session_state.minute_data)
+
+    # 绘图
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价"))
+    fig.add_trace(go.Scatter(x=df['time'], y=df['MA5'], name="MA5"))
+    fig.add_trace(go.Scatter(x=df['time'], y=df['MA20'], name="MA20"))
+    if vwap:
+        fig.add_hline(y=vwap, line_dash="dot", line_color="orange", annotation_text=f"VWAP={vwap:.2f}")
+    fig.update_layout(title="趋势与指标", height=400)
+    st.plotly_chart(fig)
+
+    # 指标提示
+    st.subheader("指标提示")
+    if df['MA5'].iloc[-1] > df['MA20'].iloc[-1]:
+        st.success("MA5 在 MA20 上方 → 短期趋势偏多")
+    else:
+        st.warning("MA5 在 MA20 下方 → 短期趋势偏空")
+    if vwap and df['close'].iloc[-1] > vwap:
+        st.info("当前价在 VWAP 上方，资金偏强")
+    elif vwap:
+        st.info("当前价在 VWAP 下方，资金偏弱")
+
+# ---------------------------
+# 新增策略信号提示
+# ---------------------------
+
+def render_tab_signals():
+    st.subheader("策略信号提示")
+    if not st.session_state.get("minute_data"):
+        st.warning("请先在【数据】标签页获取或生成分钟数据")
+        return
+
+    last_price = st.session_state.minute_data[-1]['close']
+    vwap = calculate_vwap(st.session_state.minute_data)
+    buy_levels = st.session_state.get("buy_grids", [])
+    sell_levels = st.session_state.get("sell_grids", [])
+
+    if buy_levels and last_price <= buy_levels[0]:
+        st.success(f"提示：价格已接近买入网格 {buy_levels[0]} → 可以考虑小仓位买入")
+    elif sell_levels and last_price >= sell_levels[0]:
+        st.error(f"提示：价格已接近卖出网格 {sell_levels[0]} → 可以考虑部分卖出")
+    else:
+        st.info("提示：价格处于网格中性区间，耐心等待信号")
+
+    if vwap:
+        if last_price > vwap:
+            st.markdown("📈 当前价高于 VWAP，说明资金面偏多。")
+        else:
+            st.markdown("📉 当前价低于 VWAP，说明资金面偏空。")
+
+# ---------------------------
+# 新增新手引导页
+# ---------------------------
+
+def render_tab_guide():
+    st.subheader("新手引导页")
+    st.markdown("""
+    本页面将带你逐步完成一次 ETF 日内网格交易模拟：
+
+    1. **获取数据**  
+       - 打开【数据】标签页，从雅虎财经获取分钟数据，或生成模拟数据。  
+
+    2. **生成网格**  
+       - 在【策略】标签页，选择网格数量和间距，系统会自动生成买入卖出价格区间。  
+
+    3. **执行回测**  
+       - 打开【回测】标签页，点击“开始回测”，查看净值曲线和交易记录。  
+
+    4. **查看指标**  
+       - 在【趋势指标】标签页，观察 MA5、MA20 和 VWAP，判断市场趋势。  
+
+    5. **操作信号**  
+       - 最后在【策略信号】标签页，系统会给出“买入/卖出/观望”的提示。  
+
+    ✅ 建议：初学者先用模拟数据熟悉流程，再尝试真实数据。
+    """)
+
+# ---------------------------
+# 修改标签页渲染函数
+# ---------------------------
 
 def render_tabs():
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "数据", "策略", "回测", "参数分析", "ETF对比", "帮助"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "数据", "策略", "回测", "参数分析", "ETF对比", "帮助", "趋势指标", "策略信号", "新手引导"
     ])
     
     with tab1:
@@ -731,6 +828,12 @@ def render_tabs():
         render_tab_etf_compare()
     with tab6:
         render_tab_help()
+    with tab7:
+        render_tab_indicators()
+    with tab8:
+        render_tab_signals()
+    with tab9:
+        render_tab_guide()
 
 # ---------------------------
 # Main app
@@ -776,4 +879,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
