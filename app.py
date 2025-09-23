@@ -1,4 +1,4 @@
-# ETF日内网格策略 - 完整增强版
+# ETF日内网格策略 - 增强专业版
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 import pytz
 import math
-import io
+import ta  # 新增技术指标库
 
 # ---------------------------
 # 工具函数
@@ -102,6 +102,157 @@ def get_hk_trading_status():
         return {"status": "午间休市", "message": f"距离下午开盘还有 {wait} 分钟", "next_open": "13:00"}
     else:
         return {"status": "已收盘", "message": "今日交易已结束", "next_open": "次日 09:30"}
+
+# ---------------------------
+# 增强技术指标计算
+# ---------------------------
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """计算MACD指标"""
+    if len(prices) < slow:
+        return None, None, None
+    
+    df = pd.DataFrame({'close': prices})
+    df['EMA_fast'] = df['close'].ewm(span=fast).mean()
+    df['EMA_slow'] = df['close'].ewm(span=slow).mean()
+    df['MACD'] = df['EMA_fast'] - df['EMA_slow']
+    df['MACD_signal'] = df['MACD'].ewm(span=signal).mean()
+    df['MACD_histogram'] = df['MACD'] - df['MACD_signal']
+    
+    return df['MACD'].iloc[-1], df['MACD_signal'].iloc[-1], df['MACD_histogram'].iloc[-1]
+
+def calculate_bollinger_bands(prices, window=20, num_std=2):
+    """计算布林带"""
+    if len(prices) < window:
+        return None, None, None
+    
+    df = pd.DataFrame({'close': prices})
+    df['MA'] = df['close'].rolling(window=window).mean()
+    df['STD'] = df['close'].rolling(window=window).std()
+    df['Upper'] = df['MA'] + (df['STD'] * num_std)
+    df['Lower'] = df['MA'] - (df['STD'] * num_std)
+    
+    return df['Upper'].iloc[-1], df['MA'].iloc[-1], df['Lower'].iloc[-1]
+
+def calculate_ichimoku_cloud(highs, lows, closes, tenkan=9, kijun=26, senkou=52):
+    """计算一目均衡表（Ichimoku Cloud）"""
+    if len(closes) < senkou:
+        return None
+    
+    high = pd.Series(highs)
+    low = pd.Series(lows)
+    close = pd.Series(closes)
+    
+    # 转换线
+    tenkan_high = high.rolling(tenkan).max()
+    tenkan_low = low.rolling(tenkan).min()
+    tenkan_sen = (tenkan_high + tenkan_low) / 2
+    
+    # 基准线
+    kijun_high = high.rolling(kijun).max()
+    kijun_low = low.rolling(kijun).min()
+    kijun_sen = (kijun_high + kijun_low) / 2
+    
+    # 先行带A
+    senkou_a = ((tenkan_sen + kijun_sen) / 2).shift(kijun)
+    
+    # 先行带B
+    senkou_high = high.rolling(senkou).max()
+    senkou_low = low.rolling(senkou).min()
+    senkou_b = ((senkou_high + senkou_low) / 2).shift(kijun)
+    
+    # 延迟线
+    chikou_span = close.shift(-kijun)
+    
+    return {
+        'tenkan': tenkan_sen.iloc[-1],
+        'kijun': kijun_sen.iloc[-1],
+        'senkou_a': senkou_a.iloc[-1],
+        'senkou_b': senkou_b.iloc[-1],
+        'chikou': chikou_span.iloc[-kijun] if len(closes) >= kijun*2 else None
+    }
+
+def calculate_fibonacci_levels(high, low):
+    """计算斐波那契回撤水平"""
+    diff = high - low
+    return {
+        '0.0%': high,
+        '23.6%': high - diff * 0.236,
+        '38.2%': high - diff * 0.382,
+        '50.0%': high - diff * 0.5,
+        '61.8%': high - diff * 0.618,
+        '78.6%': high - diff * 0.786,
+        '100.0%': low
+    }
+
+def calculate_support_resistance(prices, window=20):
+    """自动计算支撑阻力位"""
+    if len(prices) < window:
+        return [], []
+    
+    df = pd.DataFrame({'price': prices})
+    
+    # 使用滚动窗口识别局部极值点
+    df['max'] = df['price'].rolling(window, center=True).max()
+    df['min'] = df['price'].rolling(window, center=True).min()
+    
+    resistance = df[df['price'] == df['max']]['price'].unique()
+    support = df[df['price'] == df['min']]['price'].unique()
+    
+    # 取最重要的几个水平
+    resistance = sorted(resistance, reverse=True)[:5]
+    support = sorted(support)[:5]
+    
+    return support, resistance
+
+# ---------------------------
+# 机器学习辅助预测（简化版）
+# ---------------------------
+
+def calculate_price_trend(minute_data, lookback_periods=[5, 10, 20]):
+    """计算价格趋势强度"""
+    if len(minute_data) < max(lookback_periods):
+        return 0
+    
+    closes = [d['close'] for d in minute_data]
+    current_price = closes[-1]
+    
+    trend_strength = 0
+    for period in lookback_periods:
+        if len(closes) >= period:
+            past_price = closes[-period]
+            change_pct = (current_price - past_price) / past_price * 100
+            # 权重随周期增加而减小
+            weight = 1.0 / period
+            trend_strength += change_pct * weight
+    
+    return trend_strength
+
+def predict_next_movement(minute_data, method='simple'):
+    """简单预测下一期价格运动"""
+    if len(minute_data) < 10:
+        return 0, 0.5
+    
+    closes = [d['close'] for d in minute_data]
+    volumes = [d['volume'] for d in minute_data]
+    
+    # 简单移动平均趋势
+    ma_short = sum(closes[-5:]) / 5
+    ma_long = sum(closes[-10:]) / 10
+    ma_trend = 1 if ma_short > ma_long else -1
+    
+    # 价格动量
+    momentum = (closes[-1] - closes[-5]) / closes[-5] * 100
+    
+    # 成交量变化
+    volume_trend = (volumes[-1] - sum(volumes[-5:-1])/4) / (sum(volumes[-5:-1])/4) * 100
+    
+    # 综合预测
+    if method == 'simple':
+        direction = 1 if momentum > 0 else -1
+        confidence = min(abs(momentum) / 2, 0.8)  # 置信度基于动量大小
+        
+    return direction, confidence
 
 # ---------------------------
 # 数据获取函数
@@ -234,17 +385,45 @@ def calculate_rsi(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return [50] + rsi.fillna(50).tolist()
 
+def calculate_obv(prices, volumes):
+    """计算能量潮(OBV)"""
+    if len(prices) < 2:
+        return [0]
+    
+    obv = [0]
+    for i in range(1, len(prices)):
+        if prices[i] > prices[i-1]:
+            obv.append(obv[-1] + volumes[i])
+        elif prices[i] < prices[i-1]:
+            obv.append(obv[-1] - volumes[i])
+        else:
+            obv.append(obv[-1])
+    
+    return obv
+
 # ---------------------------
-# 网格生成函数
+# 智能网格生成函数
 # ---------------------------
 
 def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, grid_upper, grid_lower, 
-                                    center_moving=False, center_price=None, volatility_mode=False, minute_data=None):
-    """生成日内网格"""
+                                    center_moving=False, center_price=None, volatility_mode=False, 
+                                    minute_data=None, trend_adjustment=False):
+    """生成智能日内网格"""
     if center_moving and center_price is not None:
         base = center_price
     else:
         base = current_price
+        
+    # 趋势调整因子
+    trend_factor = 1.0
+    if trend_adjustment and minute_data and len(minute_data) > 10:
+        closes = [d['close'] for d in minute_data]
+        short_ma = sum(closes[-5:]) / 5
+        long_ma = sum(closes[-10:]) / 10
+        if short_ma > long_ma:  # 上升趋势
+            trend_factor = 0.8  # 收紧买入网格
+        else:  # 下降趋势
+            trend_factor = 1.2  # 放宽买入网格
         
     if volatility_mode and minute_data:
         closes = np.array([d['close'] for d in minute_data], dtype=float)
@@ -258,7 +437,7 @@ def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, gr
         effective_spacing = spacing_pct / 100.0
         
     half = grid_count // 2
-    buy = [round(base * (1 - effective_spacing * (i + 1)), 6) for i in range(half)]
+    buy = [round(base * (1 - effective_spacing * (i + 1) * trend_factor), 6) for i in range(half)]
     sell = [round(base * (1 + effective_spacing * (i + 1)), 6) for i in range(half)]
     
     buy = [p for p in buy if p >= grid_lower]
@@ -266,6 +445,43 @@ def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, gr
     
     buy.sort(); sell.sort()
     return buy, sell
+
+def generate_adaptive_grid(current_price, minute_data, grid_count=16, method='volatility'):
+    """自适应网格生成"""
+    if not minute_data or len(minute_data) < 10:
+        return generate_intraday_grid_arithmetic(current_price, 0.3, grid_count, 
+                                               current_price*1.05, current_price*0.95)
+    
+    closes = [d['close'] for d in minute_data]
+    volumes = [d['volume'] for d in minute_data]
+    
+    if method == 'volatility':
+        # 基于波动率的网格
+        volatility = np.std(closes) / current_price * 100
+        spacing_pct = max(0.1, min(1.0, volatility * 0.5))
+        
+    elif method == 'volume_weighted':
+        # 基于成交量的网格
+        avg_volume = np.mean(volumes)
+        recent_volume = volumes[-1] if volumes else avg_volume
+        volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1
+        spacing_pct = 0.3 * min(2.0, max(0.5, volume_ratio))
+        
+    elif method == 'trend_following':
+        # 趋势跟随网格
+        trend = calculate_price_trend(minute_data)
+        if trend > 0.5:  # 强上升趋势
+            spacing_pct = 0.2  # 收紧网格
+        elif trend < -0.5:  # 强下降趋势
+            spacing_pct = 0.4  # 放宽网格
+        else:
+            spacing_pct = 0.3  # 中性
+            
+    else:
+        spacing_pct = 0.3
+    
+    return generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count,
+                                           current_price*1.05, current_price*0.95)
 
 # ---------------------------
 # 回测引擎
@@ -336,6 +552,26 @@ def compute_risk_metrics(net_values, principal, profit_rate, max_drawdown, trade
     metrics['avg_loss'] = round(float(avg_loss), 2) if avg_loss is not None else None
     metrics['profit_factor'] = round(float(profit_factor), 4) if profit_factor is not None else None
     
+    # 时间段分析
+    am_trades = 0; pm_trades = 0; am_pnl = 0.0; pm_pnl = 0.0
+    for r in trade_records:
+        t = r.get('time','')
+        if ':' in t:
+            hh = int(t.split(':')[0])
+            if 9 <= hh <= 11:
+                if r['type'].startswith('sell'):
+                    am_trades += 1
+                    am_pnl += (r.get('amount',0) - r.get('cost',0))
+            elif 13 <= hh <= 16:
+                if r['type'].startswith('sell'):
+                    pm_trades += 1
+                    pm_pnl += (r.get('amount',0) - r.get('cost',0))
+    
+    metrics['am_trades'] = am_trades
+    metrics['pm_trades'] = pm_trades
+    metrics['am_pnl'] = round(am_pnl, 2)
+    metrics['pm_pnl'] = round(pm_pnl, 2)
+    
     return metrics
 
 def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sell_grids, minute_data, cfg):
@@ -356,16 +592,44 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
     stop_loss_pct = cfg.get("stop_loss_pct", None)
     take_profit_pct = cfg.get("take_profit_pct", None)
     max_position_pct = cfg.get("max_position_pct", 0.5)
+    
+    # 新增风控参数
+    trailing_stop_pct = cfg.get("trailing_stop_pct", None)
+    time_based_exit = cfg.get("time_based_exit", None)
+    volatility_filter = cfg.get("volatility_filter", None)
 
     initial_net = principal
+    peak_net = principal  # 用于跟踪止损
+    total_trades_today = 0
+    realized_pnl = 0.0
+    buy_queue = []
+    
+    # 波动率过滤
+    if volatility_filter and len(minute_data) > 10:
+        closes = [d['close'] for d in minute_data[:10]]  # 使用前10个数据点计算初始波动率
+        initial_volatility = np.std(closes) / np.mean(closes) if np.mean(closes) > 0 else 0
 
-    for row in minute_data:
+    for i, row in enumerate(minute_data):
         t = row["time"]
         high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+        
+        # 波动率过滤
+        if volatility_filter and i >= 10:
+            recent_closes = [d['close'] for d in minute_data[max(0, i-10):i]]
+            current_volatility = np.std(recent_closes) / np.mean(recent_closes) if np.mean(recent_closes) > 0 else 0
+            if current_volatility > initial_volatility * volatility_filter:
+                # 波动率过高，跳过交易
+                holdings_value = shares * close
+                net_value = cash + holdings_value
+                timestamps.append(t)
+                net_values.append(round(net_value, 4))
+                holdings_history.append(shares)
+                continue
+        
         triggered = True
         while triggered:
             triggered = False
-            for bp in buy_list:
+            for bp in list(buy_list):
                 if low <= bp:
                     current_position_value = shares * bp
                     allowed_position_value = principal * max_position_pct
@@ -378,8 +642,12 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
                     buy_shares = lots
                     buy_amount = buy_shares * bp
                     cost = calculate_trade_cost_simple(buy_amount, cfg, side='buy')
+                    if cash < (buy_amount + cost):
+                        continue
                     shares += buy_shares
                     cash -= (buy_amount + cost)
+                    total_trades_today += 1
+                    buy_queue.append({'price': bp, 'shares': buy_shares, 'cost': cost})
                     trade_records.append({
                         "time": t, "type": "buy", "price": bp, "shares": buy_shares,
                         "amount": round(buy_amount, 2), "cost": round(cost, 2),
@@ -388,7 +656,10 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
                     buy_list.remove(bp)
                     triggered = True
                     break
-            for sp in reversed(sell_list):
+            if triggered:
+                continue
+                
+            for sp in list(reversed(sell_list)):
                 if high >= sp and shares >= shares_per_lot:
                     max_lots_by_amount = int((single_trade_amount / sp) // shares_per_lot) * shares_per_lot
                     max_lots_by_shares = int(shares // shares_per_lot) * shares_per_lot
@@ -400,6 +671,22 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
                     cost = calculate_trade_cost_simple(sell_amount, cfg, side='sell')
                     shares -= sell_shares
                     cash += (sell_amount - cost)
+                    total_trades_today += 1
+                    remaining = sell_shares
+                    realized_this = 0.0
+                    while remaining > 0 and buy_queue:
+                        lot = buy_queue[0]
+                        if lot['shares'] <= remaining:
+                            matched = lot['shares']
+                            realized_this += matched * (sp - lot['price'])
+                            remaining -= matched
+                            buy_queue.pop(0)
+                        else:
+                            matched = remaining
+                            realized_this += matched * (sp - lot['price'])
+                            lot['shares'] -= matched
+                            remaining = 0
+                    realized_pnl += realized_this
                     trade_records.append({
                         "time": t, "type": "sell", "price": sp, "shares": sell_shares,
                         "amount": round(sell_amount, 2), "cost": round(cost, 2),
@@ -411,11 +698,48 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
 
         holdings_value = shares * close
         net_value = cash + holdings_value
+        
+        # 更新峰值净值（用于跟踪止损）
+        if net_value > peak_net:
+            peak_net = net_value
+            
+        # 跟踪止损
+        if trailing_stop_pct and net_value < peak_net * (1 - trailing_stop_pct / 100.0):
+            if shares >= shares_per_lot:
+                sell_shares = int(shares // shares_per_lot) * shares_per_lot
+                sell_amount = sell_shares * close
+                cost = calculate_trade_cost_simple(sell_amount, cfg, side='sell')
+                shares -= sell_shares
+                cash += (sell_amount - cost)
+                trade_records.append({
+                    "time": t, "type": "trailing_stop_sell", "price": close, "shares": sell_shares,
+                    "amount": round(sell_amount, 2), "cost": round(cost, 2),
+                    "cash_after": round(cash, 2), "holding_after": shares
+                })
+            break
+            
+        # 时间止损
+        if time_based_exit and ':' in t:
+            hour = int(t.split(':')[0])
+            if hour >= time_based_exit and shares > 0:
+                sell_shares = int(shares // shares_per_lot) * shares_per_lot
+                if sell_shares > 0:
+                    sell_amount = sell_shares * close
+                    cost = calculate_trade_cost_simple(sell_amount, cfg, side='sell')
+                    shares -= sell_shares
+                    cash += (sell_amount - cost)
+                    trade_records.append({
+                        "time": t, "type": "time_exit_sell", "price": close, "shares": sell_shares,
+                        "amount": round(sell_amount, 2), "cost": round(cost, 2),
+                        "cash_after": round(cash, 2), "holding_after": shares
+                    })
+                break
+
         timestamps.append(t)
         net_values.append(round(net_value, 4))
         holdings_history.append(shares)
         
-        # 止损检查
+        # 固定止损检查
         if stop_loss_pct is not None and net_value <= initial_net * (1 - stop_loss_pct / 100.0):
             if shares >= shares_per_lot:
                 sell_shares = int(shares // shares_per_lot) * shares_per_lot
@@ -430,7 +754,7 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
                 })
             break
             
-        # 止盈检查
+        # 固定止盈检查
         if take_profit_pct is not None and net_value >= initial_net * (1 + take_profit_pct / 100.0):
             if shares >= shares_per_lot:
                 sell_shares = int(shares // shares_per_lot) * shares_per_lot
@@ -445,19 +769,31 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
                 })
             break
 
-    final_total = net_values[-1] if net_values else (cash + shares * current_price)
+    # 收盘强制平仓
+    if cfg.get("force_close_end_of_day", False) and shares > 0:
+        last_close = minute_data[-1]['close'] if minute_data else current_price
+        sell_shares = int(shares // shares_per_lot) * shares_per_lot
+        if sell_shares > 0:
+            sell_amount = sell_shares * last_close
+            cost = calculate_trade_cost_simple(sell_amount, cfg, side='sell')
+            shares -= sell_shares
+            cash += (sell_amount - cost)
+            trade_records.append({
+                "time": minute_data[-1]['time'] if minute_data else '', 
+                "type": "eod_sell", "price": last_close, "shares": sell_shares,
+                "amount": round(sell_amount, 2), "cost": round(cost, 2),
+                "cash_after": round(cash, 2), "holding_after": shares
+            })
+
+    final_total = cash + shares * (minute_data[-1]['close'] if minute_data else current_price)
     total_profit = final_total - principal
     profit_rate = (total_profit / principal) * 100 if principal != 0 else 0
     
-    buys = [r for r in trade_records if r["type"] == "buy"]
-    sells = [r for r in trade_records if r["type"].startswith("sell")]
-    total_buy_count = len(buys)
-    total_sell_count = len(sells)
-    
+    total_buy_count = sum(1 for r in trade_records if r['type']=='buy')
+    total_sell_count = sum(1 for r in trade_records if r['type'].startswith('sell'))
     avg_trade_profit = (total_profit / (total_buy_count + total_sell_count)) if (total_buy_count + total_sell_count) > 0 else 0
     max_drawdown = calculate_max_drawdown_from_series(net_values)
     
-    # 计算风险指标
     metrics = compute_risk_metrics(net_values, principal, profit_rate, max_drawdown, trade_records, minute_data)
     
     return {
@@ -474,7 +810,6 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
         "holdings_history": holdings_history,
         "metrics": metrics
     }
-
 # ---------------------------
 # 敏感性分析和ETF对比
 # ---------------------------
@@ -531,14 +866,16 @@ def compare_etfs(etf_codes, principal, data_interval, cfg):
             })
     return pd.DataFrame(comparison)
 
+
 # ---------------------------
-# 侧边栏参数设置
+# 侧边栏参数设置（优化版）
 # ---------------------------
 
 def render_sidebar():
     st.sidebar.header("🎯 参数与风控设置")
     
     # 基本信息
+    st.sidebar.subheader("📋 基本信息")
     principal_str = st.sidebar.text_input("交易本金（港元）", value="100000", 
                                         help="总投入本金。例如100000。新手建议 50,000-200,000 HKD")
     try:
@@ -581,8 +918,8 @@ def render_sidebar():
 
     # 滑点设置
     rec_low, rec_mid, rec_high = recommend_slippage_by_turnover(avg_daily_turnover)
-    slippage_pct = st.sidebar.number_input("滑点（%）", min_value=0.0, value=rec_mid, step=0.01,
-                                         help="成交价格偏离预期估计，高流动性0.03%-0.3%，低流动性更高")
+    slippage_pct = st.sidebar.slider("滑点（%）", min_value=0.01, max_value=2.0, value=float(rec_mid), step=0.01,
+                                   help="成交价格偏离预期估计，高流动性0.03%-0.3%，低流动性更高")
     
     if st.sidebar.button("应用建议滑点"):
         slippage_pct = rec_mid
@@ -591,78 +928,97 @@ def render_sidebar():
     st.sidebar.subheader("📈 网格与数据周期")
     
     data_interval = st.sidebar.selectbox("数据周期（分钟）", [1, 5, 15], index=1)
-    grid_type = st.sidebar.radio("网格间距方式", ["动态间距（基于ATR）", "固定间距（手动）", "基于波动率（Std）"])
     
-    grid_count = st.sidebar.slider("网格总档数（买+卖）", 10, 30, 16, 2,
+    # 高级网格选项
+    grid_type = st.sidebar.selectbox("网格策略类型", 
+                                   ["标准网格", "动态间距（基于ATR）", "基于波动率（Std）", "自适应网格", "趋势调整网格"],
+                                   help="选择不同的网格生成策略")
+    
+    grid_count = st.sidebar.slider("网格总档数（买+卖）", 8, 40, 16, 2,
                                  help="网格总档数越高越密集，交易越频繁。新手推荐 12-20")
     
+    # 动态参数
     fixed_spacing_pct = None
     volatility_multiplier = None
+    adaptive_method = None
     
-    if grid_type == "固定间距（手动）":
-        fixed_spacing_str = st.sidebar.text_input("固定间距（%）", value="0.3")
-        try:
-            fixed_spacing_pct = float(fixed_spacing_str)
-        except:
-            fixed_spacing_pct = 0.3
+    if grid_type == "标准网格":
+        fixed_spacing_pct = st.sidebar.slider("固定间距（%）", 0.1, 1.0, 0.3, 0.05)
     elif grid_type == "基于波动率（Std）":
-        vol_mult_str = st.sidebar.text_input("波动率间距倍数", value="0.5")
-        try:
-            volatility_multiplier = float(vol_mult_str)
-        except:
-            volatility_multiplier = 0.5
+        volatility_multiplier = st.sidebar.slider("波动率间距倍数", 0.1, 2.0, 0.5, 0.1)
+    elif grid_type == "自适应网格":
+        adaptive_method = st.sidebar.selectbox("自适应方法", ["volatility", "volume_weighted", "trend_following"])
     
     dynamic_grid_center = st.sidebar.checkbox("动态网格中心（随VWAP/均线移动）", value=False)
+    trend_adjustment = st.sidebar.checkbox("趋势调整网格间距", value=False)
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🛡️ 仓位与风控")
+    st.sidebar.subheader("🛡️ 仓位与风控（重要）")
     
-    # 仓位参数
-    initial_cash_pct_str = st.sidebar.text_input("初始可用现金占本金（%）", value="50")
-    try:
-        initial_cash_pct = float(initial_cash_pct_str) / 100.0
-    except:
-        initial_cash_pct = 0.5
+    # 使用滑块优化输入体验
+    initial_cash_pct = st.sidebar.slider("初始可用现金占本金（%）", 10, 100, 50, 5,
+                                       help="初始用于交易的现金占本金比例。默认50%")
+    initial_cash_pct = initial_cash_pct / 100.0
         
-    single_trade_pct_str = st.sidebar.text_input("单次交易金额占本金（%）", value="5")
-    try:
-        single_trade_pct = float(single_trade_pct_str) / 100.0
-    except:
-        single_trade_pct = 0.05
+    single_trade_pct = st.sidebar.slider("单次交易金额占本金（%）", 1, 20, 5, 1,
+                                       help="单笔委托最大占本金比例。推荐 2-10%，新手 5%")
+    single_trade_pct = single_trade_pct / 100.0
         
-    shares_per_lot_str = st.sidebar.text_input("每手股数", value="100")
-    try:
-        shares_per_lot = int(float(shares_per_lot_str))
-    except:
-        shares_per_lot = 100
+    # 修复每手股数输入 - 使用数字输入框，步长为100
+    shares_per_lot = st.sidebar.number_input("每手股数", min_value=1, max_value=10000, value=100, step=100,
+                                           help="香港市场通常一手100股（ETF通常100）。请根据具体ETF调整")
         
-    max_position_pct_str = st.sidebar.text_input("最大持仓占本金（%）", value="50")
-    try:
-        max_position_pct = float(max_position_pct_str) / 100.0
-    except:
-        max_position_pct = 0.5
+    max_position_pct = st.sidebar.slider("最大持仓占本金（%）", 10, 100, 50, 5,
+                                       help="单日最大可持仓占本金比例，防止单边风险。新手建议 30%-50%")
+    max_position_pct = max_position_pct / 100.0
 
-    # 风控参数
-    stop_loss_pct_str = st.sidebar.text_input("全局止损阈值（%），0为不启用", value="0")
-    try:
-        stop_loss_pct = float(stop_loss_pct_str) if float(stop_loss_pct_str) > 0 else None
-    except:
-        stop_loss_pct = None
+    # 高级风控参数
+    st.sidebar.markdown("**🎯 止损止盈设置**")
+    col1, col2 = st.sidebar.columns(2)
+    
+    with col1:
+        stop_loss_pct = st.slider("止损（%）", 0.0, 10.0, 0.0, 0.5,
+                                help="当回测净值较初始下跌超过该阈值时触发平仓保护")
+        stop_loss_pct = stop_loss_pct if stop_loss_pct > 0 else None
         
-    take_profit_pct_str = st.sidebar.text_input("全局止盈阈值（%），0为不启用", value="0")
-    try:
-        take_profit_pct = float(take_profit_pct_str) if float(take_profit_pct_str) > 0 else None
-    except:
-        take_profit_pct = None
+    with col2:
+        take_profit_pct = st.slider("止盈（%）", 0.0, 20.0, 0.0, 0.5,
+                                  help="当回测净值较初始上涨超过该阈值时触发止盈平仓")
+        take_profit_pct = take_profit_pct if take_profit_pct > 0 else None
+
+    # 新增高级风控
+    st.sidebar.markdown("**⚡ 高级风控选项**")
+    
+    trailing_stop_pct = st.sidebar.slider("跟踪止损（%）", 0.0, 5.0, 0.0, 0.1,
+                                        help="从最高点回撤该百分比时触发止损")
+    trailing_stop_pct = trailing_stop_pct if trailing_stop_pct > 0 else None
+    
+    time_based_exit = st.sidebar.slider("时间止损（小时）", 0, 16, 0,
+                                      help="在指定时间强制平仓（0为不启用）")
+    time_based_exit = time_based_exit if time_based_exit > 0 else None
+    
+    volatility_filter = st.sidebar.slider("波动率过滤倍数", 1.0, 3.0, 1.0, 0.1,
+                                        help="当波动率超过初始值倍数时暂停交易")
+    volatility_filter = volatility_filter if volatility_filter > 1.0 else None
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("💰 扩展费用")
+    st.sidebar.subheader("💰 扩展费用 & 限制")
     
-    stamp_duty_str = st.sidebar.text_input("印花税（卖出，%）", value="0")
-    try:
-        stamp_duty_pct = float(stamp_duty_str)
-    except:
-        stamp_duty_pct = 0.0
+    stamp_duty_pct = st.sidebar.slider("印花税（卖出，%）", 0.0, 1.0, 0.0, 0.01,
+                                     help="卖出时适用的印花税百分比，如适用请填写（ETF通常为0）")
+    
+    financing_interest_pct = st.sidebar.slider("融资利息年化（%）", 0.0, 10.0, 0.0, 0.1,
+                                            help="若回测需要考虑融资融券利息，可在此输入年化利率")
+    
+    max_daily_trades = st.sidebar.slider("单日最大交易次数", 0, 100, 0, 5,
+                                       help="限制每天最大交易笔数以防过度交易。0 表示不限制")
+    max_daily_trades = max_daily_trades if max_daily_trades > 0 else None
+    
+    single_max_loss_pct = st.sidebar.slider("单日最大亏损阈值（%）", 0.0, 10.0, 0.0, 0.5,
+                                          help="当日已实现亏损超过此阈值则强制清仓")
+    single_max_loss_pct = single_max_loss_pct if single_max_loss_pct > 0 else None
+    
+    force_close_end_of_day = st.sidebar.checkbox("收盘强制清仓（只做日内）", value=False)
 
     # 构建配置字典
     cfg = {
@@ -678,17 +1034,26 @@ def render_sidebar():
         "max_position_pct": max_position_pct,
         "stop_loss_pct": stop_loss_pct,
         "take_profit_pct": take_profit_pct,
+        "trailing_stop_pct": trailing_stop_pct,
+        "time_based_exit": time_based_exit,
+        "volatility_filter": volatility_filter,
         "stamp_duty_pct": stamp_duty_pct,
+        "financing_interest_pct": financing_interest_pct,
+        "max_daily_trades": max_daily_trades,
+        "single_max_loss_pct": single_max_loss_pct,
+        "force_close_end_of_day": force_close_end_of_day,
         "grid_type": grid_type,
         "volatility_multiplier": volatility_multiplier,
+        "adaptive_method": adaptive_method,
         "dynamic_grid_center": dynamic_grid_center,
+        "trend_adjustment": trend_adjustment,
         "data_interval": data_interval,
     }
     
     return principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct, avg_daily_turnover
 
 # ---------------------------
-# 标签页渲染函数
+# 标签页实现
 # ---------------------------
 
 def render_tab_data():
@@ -703,7 +1068,7 @@ def render_tab_data():
         st.write("**数据来源：雅虎财经**")
         
     with col2:
-        if st.button("🔄 从雅虎财经获取当天分钟数据", type="primary"):
+        if st.button("🔄 从雅虎财经获取当天每隔5分钟数据", type="primary"):
             etf_code = st.session_state.get("etf_code", "2800.HK")
             interval = st.session_state.get("data_interval", 5)
             imap = {1:"1m", 5:"5m", 15:"15m"}
@@ -769,213 +1134,360 @@ def render_tab_strategy():
     st.subheader("🎯 网格策略设置")
     
     if not st.session_state.get("minute_data"):
-        st.warning("⚠️ 请先在【数据】标签页获取或生成分钟数据")
+        st.warning("请先在数据标签页获取数据")
         return
     
     current_price = st.session_state.current_price
-    cfg = st.session_state.cfg
-    grid_count = st.session_state.grid_count
-    grid_type = st.session_state.grid_type
-    fixed_spacing_pct = st.session_state.fixed_spacing_pct
+    minute_data = st.session_state.minute_data
     
-    # 计算网格间距
-    if grid_type == "动态间距（基于ATR）":
-        highs = [d['high'] for d in st.session_state.minute_data]
-        lows = [d['low'] for d in st.session_state.minute_data]
-        closes = [d['close'] for d in st.session_state.minute_data]
-        atr_values = calculate_atr(highs, lows, closes)
-        atr = atr_values[-1] if atr_values else 0
-        atr_pct = (atr / current_price) * 100 if current_price != 0 else 0.3
-        spacing_pct = max(0.1, round(atr_pct / 2, 2))
-        st.info(f"📏 基于ATR的动态间距：{spacing_pct}%（最新ATR：{atr:.4f}）")
-    elif grid_type == "基于波动率（Std）":
-        spacing_pct = cfg.get("volatility_multiplier", 0.5)
-        st.info(f"📊 基于Std的间距倍数：{spacing_pct}")
-    else:
-        spacing_pct = fixed_spacing_pct if fixed_spacing_pct is not None else 0.3
-        st.info(f"📍 固定间距：{spacing_pct}%")
-    
-    # 动态网格中心
-    center_price = None
-    if cfg.get("dynamic_grid_center", False):
-        vwap = calculate_vwap(st.session_state.minute_data)
-        if vwap:
-            center_price = vwap
-            st.info(f"🎯 动态网格中心使用 VWAP: {vwap:.4f}")
-        else:
-            df = pd.DataFrame(st.session_state.minute_data)
-            if len(df) >= 5:
-                center_price = df['close'].rolling(5).mean().iloc[-1]
-                st.info(f"🎯 动态中心使用 MA5: {center_price:.4f}")
-            else:
-                center_price = current_price
-    
-    # 网格范围
-    upper_limit = current_price * 1.05
-    lower_limit = current_price * 0.95
-    st.write(f"📋 网格范围：{lower_limit:.4f} - {upper_limit:.4f}（当前价±5%）")
-    
-    # 生成网格
-    if grid_type == "基于波动率（Std）":
+    # 网格生成
+    if st.session_state.grid_type == "标准网格":
         buy_grids, sell_grids = generate_intraday_grid_arithmetic(
-            current_price, spacing_pct, grid_count, upper_limit, lower_limit,
-            center_moving=bool(center_price is not None), center_price=center_price,
-            volatility_mode=True, minute_data=st.session_state.minute_data
+            current_price, 
+            st.session_state.fixed_spacing_pct,
+            st.session_state.grid_count,
+            current_price * 1.05,
+            current_price * 0.95
+        )
+    elif st.session_state.grid_type == "自适应网格":
+        buy_grids, sell_grids = generate_adaptive_grid(
+            current_price,
+            minute_data,
+            st.session_state.grid_count,
+            st.session_state.cfg.get("adaptive_method", "volatility")
         )
     else:
+        # 默认网格
         buy_grids, sell_grids = generate_intraday_grid_arithmetic(
-            current_price, spacing_pct, grid_count, upper_limit, lower_limit,
-            center_moving=bool(center_price is not None), center_price=center_price
+            current_price, 0.3, st.session_state.grid_count,
+            current_price * 1.05, current_price * 0.95
         )
+    
+    st.session_state.buy_grids = buy_grids
+    st.session_state.sell_grids = sell_grids
     
     # 显示网格
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("🟢 买入网格")
+        st.write("**买入网格**")
         if buy_grids:
-            buy_df = pd.DataFrame({"价格（港元）": buy_grids})
-            st.dataframe(buy_df, use_container_width=True)
+            for i, price in enumerate(buy_grids):
+                st.write(f"{i+1}. {price:.4f} ({((current_price - price)/current_price*100):.2f}%)")
         else:
-            st.info("无买入网格")
+            st.write("无买入网格")
     
     with col2:
-        st.subheader("🔴 卖出网格")
+        st.write("**卖出网格**")
         if sell_grids:
-            sell_df = pd.DataFrame({"价格（港元）": sell_grids})
-            st.dataframe(sell_df, use_container_width=True)
+            for i, price in enumerate(sell_grids):
+                st.write(f"{i+1}. {price:.4f} ({((price - current_price)/current_price*100):.2f}%)")
         else:
-            st.info("无卖出网格")
+            st.write("无卖出网格")
     
-    # 网格可视化
+    # 网格统计信息
+    if buy_grids and sell_grids:
+        st.subheader("📈 网格统计信息")
+        
+        avg_buy_spacing = np.mean([current_price - p for p in buy_grids]) / current_price * 100 if buy_grids else 0
+        avg_sell_spacing = np.mean([p - current_price for p in sell_grids]) / current_price * 100 if sell_grids else 0
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("买入档数", len(buy_grids))
+        col2.metric("卖出档数", len(sell_grids))
+        col3.metric("平均买入间距", f"{avg_buy_spacing:.2f}%")
+        col4.metric("平均卖出间距", f"{avg_sell_spacing:.2f}%")
+        
+        # 网格覆盖范围
+        coverage_low = min(buy_grids) if buy_grids else current_price
+        coverage_high = max(sell_grids) if sell_grids else current_price
+        coverage_pct = (coverage_high - coverage_low) / current_price * 100
+        
+        st.info(f"网格覆盖范围: {coverage_low:.4f} - {coverage_high:.4f} (±{coverage_pct/2:.2f}%)")
+    
+    # 网格可视化 - 修复版本
+    st.subheader("📊 网格价格分布图")
+
     if buy_grids or sell_grids:
+        # 创建价格区间
+        min_price = min(buy_grids) if buy_grids else current_price * 0.95
+        max_price = max(sell_grids) if sell_grids else current_price * 1.05
+        price_range = max_price - min_price
+        
+        # 扩展范围以便更好显示
+        y_min = min_price - price_range * 0.1
+        y_max = max_price + price_range * 0.1
+        
         fig = go.Figure()
-        fig.add_hline(y=current_price, line_dash="dash", line_color="black", 
-                     annotation_text="当前价", annotation_position="bottom right")
         
+        # 当前价格线
+        fig.add_hline(y=current_price, line_dash="dash", line_color="red", 
+                     annotation_text=f"当前价格: {current_price:.4f}", 
+                     annotation_position="top left")
+        
+        # 买入网格线（绿色）
         for i, price in enumerate(buy_grids):
-            fig.add_hline(y=price, line_color="green", line_width=1,
-                         annotation_text=f"买{i+1}" if i == 0 else "")
+            fig.add_hline(y=price, line_color="green", line_width=2,
+                         annotation_text=f"买入{i+1}: {price:.4f}", 
+                         annotation_position="bottom left")
         
+        # 卖出网格线（蓝色）
         for i, price in enumerate(sell_grids):
-            fig.add_hline(y=price, line_color="red", line_width=1,
-                         annotation_text=f"卖{i+1}" if i == 0 else "")
+            fig.add_hline(y=price, line_color="blue", line_width=2,
+                         annotation_text=f"卖出{i+1}: {price:.4f}", 
+                         annotation_position="top right")
         
-        y_min = min(buy_grids[0] if buy_grids else lower_limit, lower_limit * 0.99)
-        y_max = max(sell_grids[-1] if sell_grids else upper_limit, upper_limit * 1.01)
-        
-        fig.update_yaxes(range=[y_min, y_max])
-        fig.update_layout(
-            title="网格分布图",
-            yaxis_title="价格（港元）",
-            height=400,
+        # 添加一些虚拟数据点以确保图表正确显示
+        fig.add_trace(go.Scatter(
+            x=[0, 1], 
+            y=[y_min, y_max], 
+            mode='markers',
+            marker=dict(size=0.1, opacity=0),  # 不可见点，只是为了设置范围
             showlegend=False
+        ))
+        
+        fig.update_layout(
+            title="网格价格分布",
+            xaxis=dict(showticklabels=False, title=""),  # 隐藏x轴
+            yaxis_title="价格",
+            showlegend=False,
+            height=500,
+            yaxis=dict(range=[y_min, y_max])  # 设置y轴范围
         )
+        
         st.plotly_chart(fig, use_container_width=True)
-    
-    # 保存网格到会话状态
-    st.session_state.buy_grids = buy_grids
-    st.session_state.sell_grids = sell_grids
+    else:
+        st.warning("无法生成网格价格分布图")
 
 def render_tab_backtest():
-    st.subheader("📈 策略回测结果")
+    st.subheader("📈 策略回测")
     
-    if not all(key in st.session_state for key in ["minute_data", "buy_grids", "sell_grids"]):
-        st.warning("⚠️ 请先在【策略】标签页生成网格")
+    if not st.session_state.get("minute_data") or not st.session_state.get("buy_grids"):
+        st.warning("请先获取数据并生成网格")
         return
     
-    if st.button("🚀 开始回测", type="primary"):
-        with st.spinner("正在执行回测，请稍候..."):
+    if st.button("开始回测"):
+        with st.spinner("回测中..."):
             result = backtest_intraday_strategy_improved(
-                principal=st.session_state.principal,
-                current_price=st.session_state.current_price,
-                buy_grids=st.session_state.buy_grids,
-                sell_grids=st.session_state.sell_grids,
-                minute_data=st.session_state.minute_data,
-                cfg=st.session_state.cfg
+                st.session_state.principal,
+                st.session_state.current_price,
+                st.session_state.buy_grids,
+                st.session_state.sell_grids,
+                st.session_state.minute_data,
+                st.session_state.cfg
             )
+            
             st.session_state.backtest_result = result
-            st.success("✅ 回测完成！")
-    
-    if "backtest_result" in st.session_state and st.session_state.backtest_result:
-        res = st.session_state.backtest_result
-        
-        # 关键指标展示
-        st.subheader("📊 回测概览")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("最终净值", f"HK${res['final_total_value']:,}")
-        with col2:
-            profit_color = "normal" if res['total_profit'] >= 0 else "inverse"
-            st.metric("总收益", f"HK${res['total_profit']:,}", 
-                     f"{res['profit_rate']:.2f}%", delta_color=profit_color)
-        with col3:
-            st.metric("总交易次数", res['total_buy_count'] + res['total_sell_count'])
-        with col4:
-            st.metric("最大回撤", f"{res['max_drawdown']:.2f}%")
-        
-        # 风险指标
-        st.subheader("🛡️ 风险指标")
-        metrics = res.get("metrics", {})
-        
-        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-        mcol1.metric("夏普比率", f"{metrics.get('sharpe', 'N/A')}")
-        mcol2.metric("卡尔玛比率", f"{metrics.get('calmar', 'N/A')}")
-        mcol3.metric("胜率", f"{metrics.get('win_rate', 'N/A')}%")
-        mcol4.metric("盈亏比", f"{metrics.get('profit_factor', 'N/A')}")
-        
-        # 净值曲线
-        st.subheader("📈 净值曲线")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=res['timestamps'], y=res['net_values'], 
-                               name='净值', line=dict(color='blue', width=2)))
-        fig.update_layout(
-            title='日内净值变化',
-            xaxis_title='时间',
-            yaxis_title='净值（港元）',
-            height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 持仓变化
-        st.subheader("📦 持仓变化")
-        fig_holding = go.Figure()
-        fig_holding.add_trace(go.Scatter(x=res['timestamps'], y=res['holdings_history'],
-                                       name='持仓数量', line=dict(color='orange')))
-        fig_holding.update_layout(
-            title='持仓数量变化',
-            xaxis_title='时间',
-            yaxis_title='持仓数量',
-            height=300
-        )
-        st.plotly_chart(fig_holding, use_container_width=True)
-        
-        # 交易记录
-        st.subheader("📋 交易记录")
-        if res['trade_records']:
-            trade_df = pd.DataFrame(res['trade_records'])
             
-            # 添加总价值列
-            def compute_total_after(row):
-                try:
-                    return round(row['cash_after'] + row['holding_after'] * row['price'], 2)
-                except:
-                    return None
-                    
-            trade_df['总价值'] = trade_df.apply(compute_total_after, axis=1)
-            st.dataframe(trade_df, height=400, use_container_width=True)
+            # 显示回测结果
+            col1, col2, col3 = st.columns(3)
             
-            # CSV导出
-            csv = trade_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 下载交易记录 CSV",
-                data=csv,
-                file_name="trade_records.csv",
-                mime="text/csv"
+            with col1:
+                st.metric("最终净值", f"{result['final_total_value']:,.2f}")
+                st.metric("总利润", f"{result['total_profit']:,.2f}")
+            
+            with col2:
+                st.metric("收益率", f"{result['profit_rate']:.2f}%")
+                st.metric("最大回撤", f"{result['max_drawdown']:.2f}%")
+            
+            with col3:
+                st.metric("买入次数", result['total_buy_count'])
+                st.metric("卖出次数", result['total_sell_count'])
+            
+            # 风险指标
+            if result['metrics']:
+                st.subheader("📊 风险指标")
+                metrics = result['metrics']
+                col1, col2, col3, col4 = st.columns(4)
+                
+                if metrics.get('sharpe') is not None:
+                    col1.metric("夏普比率", f"{metrics['sharpe']:.2f}")
+                if metrics.get('calmar') is not None:
+                    col2.metric("卡尔玛比率", f"{metrics['calmar']:.2f}")
+                if metrics.get('win_rate') is not None:
+                    col3.metric("胜率", f"{metrics['win_rate']:.1f}%")
+                if metrics.get('profit_factor') is not None:
+                    col4.metric("盈亏比", f"{metrics['profit_factor']:.2f}")
+            
+            # 净值曲线
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=result['timestamps'], 
+                y=result['net_values'],
+                mode='lines',
+                name='净值'
+            ))
+            fig.update_layout(
+                title="净值曲线",
+                xaxis_title="时间",
+                yaxis_title="净值"
             )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 交易记录
+            st.subheader("交易记录")
+            if result['trade_records']:
+                trades_df = pd.DataFrame(result['trade_records'])
+                st.dataframe(trades_df, use_container_width=True)
+            else:
+                st.write("无交易记录")
+
+def render_tab_advanced_analysis():
+    st.subheader("🔬 高级技术分析")
+    
+    if not st.session_state.get("minute_data"):
+        st.warning("⚠️ 请先在【数据】标签页获取或生成分钟数据")
+        return
+    
+    df = pd.DataFrame(st.session_state.minute_data)
+    closes = df['close'].tolist()
+    highs = df['high'].tolist()
+    lows = df['low'].tolist()
+    volumes = df['volume'].tolist()
+    
+    # MACD分析
+    st.subheader("📊 MACD指标")
+    macd, signal, histogram = calculate_macd(closes)
+    
+    if macd is not None:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("MACD", f"{macd:.4f}")
+        col2.metric("信号线", f"{signal:.4f}")
+        col3.metric("柱状图", f"{histogram:.4f}")
+        
+        # MACD图表
+        fig_macd = go.Figure()
+        fig_macd.add_trace(go.Scatter(x=df['time'], y=closes, name="价格", line=dict(color='black')))
+        fig_macd.update_layout(height=300, title="价格走势与MACD分析")
+        st.plotly_chart(fig_macd, use_container_width=True)
+    
+    # 布林带分析
+    st.subheader("📈 布林带分析")
+    upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(closes)
+    
+    if upper_bb is not None:
+        current_price = closes[-1]
+        bb_position = (current_price - lower_bb) / (upper_bb - lower_bb) * 100
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("上轨", f"{upper_bb:.4f}")
+        col2.metric("中轨", f"{middle_bb:.4f}")
+        col3.metric("下轨", f"{lower_bb:.4f}")
+        col4.metric("位置%", f"{bb_position:.1f}%")
+        
+        # 布林带图表
+        fig_bb = go.Figure()
+        fig_bb.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价", line=dict(color='black')))
+        fig_bb.add_trace(go.Scatter(x=df['time'], y=[upper_bb] * len(df), name="上轨", line=dict(color='red', dash='dash')))
+        fig_bb.add_trace(go.Scatter(x=df['time'], y=[middle_bb] * len(df), name="中轨", line=dict(color='blue', dash='dash')))
+        fig_bb.add_trace(go.Scatter(x=df['time'], y=[lower_bb] * len(df), name="下轨", line=dict(color='green', dash='dash')))
+        fig_bb.update_layout(height=400, title="布林带")
+        st.plotly_chart(fig_bb, use_container_width=True)
+    
+    # 一目均衡表分析
+    st.subheader("☁️ 一目均衡表（Ichimoku Cloud）")
+    ichimoku = calculate_ichimoku_cloud(highs, lows, closes)
+
+    if ichimoku is not None:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("转换线", f"{ichimoku['tenkan']:.4f}")
+        col2.metric("基准线", f"{ichimoku['kijun']:.4f}")
+        col3.metric("先行带A", f"{ichimoku['senkou_a']:.4f}")
+        col4.metric("先行带B", f"{ichimoku['senkou_b']:.4f}")
+        col5.metric("延迟线", f"{ichimoku['chikou']:.4f}" if ichimoku['chikou'] else "N/A")
+        
+        # 云图分析
+        current_price = closes[-1]
+        if ichimoku['senkou_a'] and ichimoku['senkou_b']:
+            if current_price > max(ichimoku['senkou_a'], ichimoku['senkou_b']):
+                st.success("📈 价格在云层之上 - 强势信号")
+            elif current_price < min(ichimoku['senkou_a'], ichimoku['senkou_b']):
+                st.error("📉 价格在云层之下 - 弱势信号")
+            else:
+                st.warning("☁️ 价格在云层之中 - 震荡行情")
+
+    # ATR波动率分析
+    st.subheader("📊 ATR波动率分析")
+    atr_values = calculate_atr(highs, lows, closes)
+    if atr_values:
+        current_atr = atr_values[-1]
+        atr_percent = (current_atr / current_price) * 100
+        
+        col1, col2 = st.columns(2)
+        col1.metric("ATR(14)", f"{current_atr:.4f}")
+        col2.metric("ATR%", f"{atr_percent:.2f}%")
+        
+        # ATR图表
+        fig_atr = go.Figure()
+        fig_atr.add_trace(go.Scatter(x=df['time'], y=atr_values, name="ATR", line=dict(color='purple')))
+        fig_atr.update_layout(height=300, title="ATR波动率")
+        st.plotly_chart(fig_atr, use_container_width=True)
+
+    # OBV能量潮分析
+    st.subheader("🌊 OBV能量潮")
+    obv_values = calculate_obv(closes, volumes)
+    if obv_values:
+        current_obv = obv_values[-1]
+    
+        # 修复趋势判断逻辑
+        if len(obv_values) > 5:
+            obv_trend = "上升" if current_obv > obv_values[-5] else "下降"
         else:
-            st.info("📝 未产生交易记录")
+            obv_trend = "数据不足"
+    
+        st.metric("OBV", f"{current_obv:,.0f}", obv_trend)
+    
+        # OBV图表
+        fig_obv = go.Figure()
+        fig_obv.add_trace(go.Scatter(x=df['time'], y=obv_values, name="OBV", line=dict(color='orange')))
+        fig_obv.update_layout(height=300, title="OBV能量潮")
+        st.plotly_chart(fig_obv, use_container_width=True)
+    
+    # 斐波那契回撤
+    st.subheader("🔺 斐波那契回撤水平")
+    if len(highs) > 0 and len(lows) > 0:
+        recent_high = max(highs[-20:])  # 最近20期最高价
+        recent_low = min(lows[-20:])    # 最近20期最低价
+        fib_levels = calculate_fibonacci_levels(recent_high, recent_low)
+        
+        fib_df = pd.DataFrame(list(fib_levels.items()), columns=['水平', '价格'])
+        st.dataframe(fib_df, use_container_width=True)
+        
+        # 斐波那契图表
+        fig_fib = go.Figure()
+        fig_fib.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价"))
+        for level, price in fib_levels.items():
+            fig_fib.add_hline(y=price, line_dash="dash", annotation_text=level)
+        fig_fib.update_layout(height=400, title="斐波那契回撤水平")
+        st.plotly_chart(fig_fib, use_container_width=True)
+    
+    # 支撑阻力分析
+    st.subheader("⚖️ 自动支撑阻力分析")
+    support_levels, resistance_levels = calculate_support_resistance(closes)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**支撑位**")
+        for level in support_levels[:3]:  # 只显示前3个
+            st.write(f"- {level:.4f}")
+    
+    with col2:
+        st.write("**阻力位**")
+        for level in resistance_levels[:3]:  # 只显示前3个
+            st.write(f"- {level:.4f}")
+    
+    # 价格预测
+    st.subheader("🔮 简单价格预测")
+    direction, confidence = predict_next_movement(st.session_state.minute_data)
+    
+    if direction > 0:
+        st.success(f"预测方向: 📈 上涨 | 置信度: {confidence*100:.1f}%")
+    else:
+        st.error(f"预测方向: 📉 下跌 | 置信度: {confidence*100:.1f}%")
+    
+    # 趋势强度分析
+    trend_strength = calculate_price_trend(st.session_state.minute_data)
+    st.metric("趋势强度", f"{trend_strength:.2f}")
 
 def render_tab_sensitivity():
     st.subheader("🔬 网格参数敏感性分析")
@@ -1113,86 +1625,44 @@ def render_tab_etf_compare():
             st.warning("❌ 未能获取任何ETF的数据，请检查代码是否正确")
 
 def render_tab_indicators():
-    st.subheader("📈 趋势与指标分析")
+    st.subheader("📈 趋势指标分析")
     
     if not st.session_state.get("minute_data"):
-        st.warning("⚠️ 请先在【数据】标签页获取或生成分钟数据")
+        st.warning("请先获取数据")
         return
     
     df = pd.DataFrame(st.session_state.minute_data)
+    closes = df['close'].tolist()
+    volumes = df['volume'].tolist()
     
-    # 计算技术指标
-    df['MA5'] = df['close'].rolling(5, min_periods=1).mean()
-    df['MA10'] = df['close'].rolling(10, min_periods=1).mean()
-    df['MA20'] = df['close'].rolling(20, min_periods=1).mean()
-    
-    vwap = calculate_vwap(st.session_state.minute_data)
-    atr_values = calculate_atr(df['high'].tolist(), df['low'].tolist(), df['close'].tolist())
-    atr = atr_values[-1] if atr_values else None
-    
-    rsi_values = calculate_rsi(df['close'].tolist())
+    # RSI计算
+    rsi_values = calculate_rsi(closes)
     current_rsi = rsi_values[-1] if rsi_values else 50
     
-    # 价格和均线图表
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价", line=dict(color='black', width=2)))
-    fig.add_trace(go.Scatter(x=df['time'], y=df['MA5'], name="MA5", line=dict(color='blue', width=1)))
-    fig.add_trace(go.Scatter(x=df['time'], y=df['MA10'], name="MA10", line=dict(color='orange', width=1)))
-    fig.add_trace(go.Scatter(x=df['time'], y=df['MA20'], name="MA20", line=dict(color='red', width=1)))
+    col1, col2, col3 = st.columns(3)
+    col1.metric("RSI", f"{current_rsi:.1f}")
     
+    # 趋势强度
+    trend_strength = calculate_price_trend(st.session_state.minute_data)
+    col2.metric("趋势强度", f"{trend_strength:.2f}")
+    
+    # VWAP
+    vwap = calculate_vwap(st.session_state.minute_data)
     if vwap:
-        fig.add_hline(y=vwap, line_dash="dot", line_color="green", 
-                     annotation_text=f"VWAP={vwap:.2f}")
+        col3.metric("VWAP", f"{vwap:.4f}")
     
-    fig.update_layout(
-        title="价格与移动平均线",
-        height=400,
-        xaxis_title='时间',
-        yaxis_title='价格（港元）'
-    )
+    # 价格和RSI图表
+    fig = make_subplots(rows=2, cols=1, subplot_titles=('价格走势', 'RSI指标'))
+    
+    fig.add_trace(go.Scatter(x=df['time'], y=df['close'], name='价格'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['time'], y=rsi_values, name='RSI'), row=2, col=1)
+    
+    # 添加RSI超买超卖线
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    
+    fig.update_layout(height=600, showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
-    
-    # RSI图表
-    fig_rsi = go.Figure()
-    fig_rsi.add_trace(go.Scatter(x=df['time'], y=rsi_values[:len(df)], name="RSI", 
-                               line=dict(color='purple')))
-    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="超买")
-    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="超卖")
-    fig_rsi.update_layout(title="RSI指标", height=300, yaxis_range=[0, 100])
-    st.plotly_chart(fig_rsi, use_container_width=True)
-    
-    # 指标提示
-    st.subheader("💡 指标提示")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        if df['MA5'].iloc[-1] > df['MA20'].iloc[-1]:
-            st.success("MA5 > MA20\n短期趋势偏多")
-        else:
-            st.warning("MA5 < MA20\n短期趋势偏空")
-    
-    with col2:
-        if vwap:
-            if df['close'].iloc[-1] > vwap:
-                st.success("价格 > VWAP\n资金面偏强")
-            else:
-                st.warning("价格 < VWAP\n资金面偏弱")
-        else:
-            st.info("VWAP不可用")
-    
-    with col3:
-        if current_rsi > 70:
-            st.error(f"RSI: {current_rsi:.1f}\n超买区域")
-        elif current_rsi < 30:
-            st.success(f"RSI: {current_rsi:.1f}\n超卖区域")
-        else:
-            st.info(f"RSI: {current_rsi:.1f}\n中性区域")
-    
-    with col4:
-        if atr:
-            atr_pct = (atr / df['close'].iloc[-1]) * 100
-            st.info(f"ATR: {atr:.4f}\n波动率: {atr_pct:.2f}%")
 
 def render_tab_signals():
     st.subheader("🔔 策略信号提示")
@@ -1260,90 +1730,57 @@ def render_tab_signals():
     else:
         st.info(f"⚖️ 建议：观望为主（{buy_signals}个买入信号，{sell_signals}个卖出信号）")
 
+
 def render_tab_help():
-    st.subheader("🕒 交易时间提醒")
+    st.subheader("🕒 港股交易时间")
     
+    st.write("""
+    ### 港股交易时间安排
+    
+    **正常交易日（周一至周五）**:
+    - 上午盘: 09:30 - 12:00
+    - 午间休市: 12:00 - 13:00  
+    - 下午盘: 13:00 - 16:00
+    
+    **注意事项**:
+    - 周六、周日及公众假期休市
+    - 开盘前竞价时段: 09:00-09:20
+    - 收盘竞价时段: 16:00-16:10
+    
+    **ETF交易特点**:
+    - T+0交易：当日可多次买卖
+    - 无涨跌幅限制
+    - 交易费用相对较低
+    """)
+    
+    # 显示当前交易状态
     status = get_hk_trading_status()
-    status_color = {
-        "交易中": "green",
-        "未开盘": "orange", 
-        "午间休市": "orange",
-        "已收盘": "red",
-        "休市": "red"
-    }.get(status["status"], "gray")
-    
-    st.markdown(f"**当前状态**: <span style='color:{status_color}; font-size: 1.2em; font-weight: bold'>{status['status']}</span>", 
-                unsafe_allow_html=True)
-    st.info(f"💡 {status['message']}")
-    
-    if status.get("next_open"):
-        st.write(f"⏰ 下次开盘: {status['next_open']}")
+    st.info(f"当前状态: {status['status']} - {status['message']}")
 
 def render_tab_guide():
     st.subheader("👨‍🏫 新手指南")
     
-    st.markdown("""
-    ## 🚀 快速开始指南
+    st.write("""
+    ### ETF网格交易策略指南
     
-    ### 第一步：获取数据
-    1. 打开【数据】标签页
-    2. 点击"从雅虎财经获取当天分钟数据"获取真实数据
-    3. 或点击"生成模拟数据"进行练习
+    **什么是网格交易？**
+    网格交易是一种在价格波动中获利的策略，通过在不同价格水平设置买入和卖出订单，
+    在价格波动时自动执行低买高卖的操作。
     
-    ### 第二步：设置网格策略
-    1. 打开【策略】标签页
-    2. 选择合适的网格间距方式：
-       - **动态间距（基于ATR）**：根据波动率自动调整（推荐新手）
-       - **固定间距（手动）**：手动设置固定间距
-       - **基于波动率（Std）**：根据标准差调整
-    3. 调整网格数量（12-20档适合新手）
+    **操作步骤**:
+    1. **设置基本参数**: 在侧边栏设置本金、ETF代码、当前价格
+    2. **获取数据**: 在"数据"标签页获取实时或模拟数据
+    3. **生成网格**: 在"策略"标签页查看生成的买卖网格
+    4. **回测验证**: 在"回测"标签页测试策略效果
+    5. **分析优化**: 使用其他标签页进行深入分析
     
-    ### 第三步：执行回测
-    1. 打开【回测】标签页
-    2. 点击"开始回测"查看策略效果
-    3. 分析净值曲线和交易记录
-    
-    ### 第四步：优化策略
-    1. 使用【参数敏感性分析】找到最优参数
-    2. 通过【多ETF对比】选择合适的产品
-    3. 参考【趋势指标】和【策略信号】辅助决策
-    
-    ## 📊 关键参数说明
-    
-    ### 基础参数
-    - **交易本金**: 建议50,000-200,000 HKD开始
-    - **ETF代码**: 香港市场ETF代码，如2800.HK（盈富基金）
-    - **当前价格**: 会自动从数据中更新
-    
-    ### 网格参数
-    - **网格档数**: 总买卖档位数量，影响交易频率
-    - **网格间距**: 每档价格间隔，影响触发频率
-    - **动态网格中心**: 让网格随价格趋势移动
-    
-    ### 风控参数
-    - **最大持仓**: 建议不超过本金的50%
-    - **止损止盈**: 设置全局风险控制
-    - **滑点设置**: 根据流动性调整
-    
-    ## 💡 新手建议
-    
-    1. **先用模拟数据练习**，熟悉流程后再用真实数据
-    2. **从小本金开始**，逐步增加投资金额
-    3. **重视风险控制**，设置合理的止损止盈
-    4. **多品种对比**，选择流动性好的ETF
-    5. **定期回顾**，根据回测结果优化策略
-    
-    ## 🎯 网格策略原理
-    
-    网格交易是一种均值回归策略，基本原理：
-    - 在价格下跌时分批买入
-    - 在价格上涨时分批卖出
-    - 通过价差获取收益
-    - 适合震荡市行情
-    
-    **优点**: 机械化操作，避免情绪影响
-    **缺点**: 单边市可能亏损，需要严格风控
+    **风险提示**:
+    - 网格策略在单边行情中可能表现不佳
+    - 实际交易前请充分回测验证
+    - 投资有风险，入市需谨慎
     """)
+    
+    st.success("💡 提示: 新手建议从模拟数据开始，熟悉策略后再使用真实数据")
 
 # ---------------------------
 # 主应用
@@ -1351,14 +1788,14 @@ def render_tab_guide():
 
 def main():
     st.set_page_config(
-        page_title="ETF日内网格策略 - 专业版",
+        page_title="ETF日内网格策略 - 增强专业版",
         page_icon="📈",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
     # 应用标题和介绍
-    st.title("📈 ETF日内T+0网格交易策略")
+    st.title("📈 ETF日内T+0网格交易策略 - 增强专业版")
     st.markdown("""
     <style>
     .main-header {
@@ -1405,9 +1842,8 @@ def main():
     
     # 标签页配置
     tabs = st.tabs([
-        "📊 数据", "🎯 策略", "📈 回测", "🔬 参数分析", 
-        "📊 ETF对比", "📈 趋势指标", "🔔 策略信号", 
-        "🕒 交易时间", "👨‍🏫 新手指南"
+        "📊 数据", "🎯 策略", "📈 回测", "🔬 高级分析", "📋 参数分析", 
+        "📊 ETF对比", "📈 趋势指标", "🔔 策略信号", "🕒 交易时间", "👨‍🏫 新手指南"
     ])
     
     with tabs[0]:
@@ -1417,23 +1853,25 @@ def main():
     with tabs[2]:
         render_tab_backtest()
     with tabs[3]:
-        render_tab_sensitivity()
+        render_tab_advanced_analysis()
     with tabs[4]:
-        render_tab_etf_compare()
+        render_tab_sensitivity()
     with tabs[5]:
-        render_tab_indicators()
+        render_tab_etf_compare()
     with tabs[6]:
-        render_tab_signals()
+        render_tab_indicators()
     with tabs[7]:
-        render_tab_help()
+        render_tab_signals()
     with tabs[8]:
+        render_tab_help()
+    with tabs[9]:
         render_tab_guide()
     
     # 页脚信息
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: gray;'>
-    <p>ETF日内网格交易策略系统 | 适合港股ETF T+0交易 | 数据来源: Yahoo Finance</p>
+    <p>ETF日内网格交易策略系统 - 增强专业版 | 适合港股ETF T+0交易 | 数据来源: Yahoo Finance</p>
     <p>⚠️ 风险提示: 本系统仅供学习参考，实际交易请谨慎决策</p>
     </div>
     """, unsafe_allow_html=True)
