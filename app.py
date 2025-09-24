@@ -6,13 +6,32 @@ from datetime import datetime, timedelta, time as dtime
 import yfinance as yf
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+import plotly.express as px
 import pytz
 import math
-import ta  # 新增技术指标库
+import ta
+import json
+import time
+import warnings
+warnings.filterwarnings('ignore')
 
 # ---------------------------
 # 工具函数
 # ---------------------------
+
+def safe_float_conversion(value, default=0.0):
+    """安全的浮点数转换"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def safe_int_conversion(value, default=0):
+    """安全的整数转换"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 def parse_volume(volume_input):
     """解析成交量字符串（如12k、3.5万）为整数"""
@@ -61,6 +80,7 @@ def calculate_trade_cost_simple(amount, cfg, side='buy'):
     total = platform_fee + trade_fee + settlement_fee + sfc_fee + frc_fee + slippage_cost + stamp
     return round(total, 2)
 
+@st.cache_data(ttl=3600)  # 1小时缓存
 def get_avg_turnover(ticker, days=20):
     """获取日均成交额"""
     try:
@@ -258,63 +278,125 @@ def predict_next_movement(minute_data, method='simple'):
 # 数据获取函数
 # ---------------------------
 
-def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d"):
-    """从雅虎财经获取分钟数据"""
+@st.cache_data(ttl=300)  # 5分钟缓存
+def cached_yahoo_download(ticker, period, interval):
+    """带缓存的数据下载"""
     try:
-        data = yf.download(etf_code, interval=interval, period=period, progress=False)
-        if data is None or data.empty:
-            return []
-        if isinstance(data.columns, pd.MultiIndex):
+        return yf.download(ticker, period=period, interval=interval, progress=False)
+    except Exception as e:
+        st.error(f"下载数据失败: {e}")
+        return None
+
+def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d", max_retries=3):
+    """从雅虎财经获取分钟数据（带重试机制）"""
+    for attempt in range(max_retries):
+        try:
+            data = cached_yahoo_download(etf_code, period=period, interval=interval)
+            if data is None or data.empty:
+                if attempt == max_retries - 1:
+                    st.error(f"获取 {etf_code} 数据失败: 数据为空")
+                    return []
+                else:
+                    st.warning(f"第 {attempt + 1} 次获取数据失败，正在重试...")
+                    time.sleep(1)
+                    continue
+            
+            # 处理多级索引
+            if isinstance(data.columns, pd.MultiIndex):
+                try:
+                    data = data.xs(etf_code, axis=1, level=1)
+                except Exception:
+                    try:
+                        data = data.xs(data.columns.levels[1][0], axis=1, level=1)
+                    except Exception:
+                        pass
+            
+            # 时区处理
             try:
-                data = data.xs(etf_code, axis=1, level=1)
+                if data.index.tz is None:
+                    data.index = data.index.tz_localize('UTC').tz_convert('Asia/Hong_Kong')
+                else:
+                    data.index = data.index.tz_convert('Asia/Hong_Kong')
             except Exception:
                 try:
-                    data = data.xs(data.columns.levels[1][0], axis=1, level=1)
+                    data.index = pd.to_datetime(data.index).tz_localize('UTC').tz_convert('Asia/Hong_Kong')
                 except Exception:
                     pass
-        # 时区处理
-        try:
-            if data.index.tz is None:
-                data.index = data.index.tz_localize('UTC').tz_convert('Asia/Hong_Kong')
-            else:
-                data.index = data.index.tz_convert('Asia/Hong_Kong')
-        except Exception:
+            
+            # 过滤交易时间
             try:
-                data.index = pd.to_datetime(data.index).tz_localize('UTC').tz_convert('Asia/Hong_Kong')
+                idx_times = data.index.time
+                mask_morning = (idx_times >= dtime(9, 30)) & (idx_times <= dtime(12, 0))
+                mask_afternoon = (idx_times >= dtime(13, 0)) & (idx_times <= dtime(16, 0))
+                mask = mask_morning | mask_afternoon
+                data = data[mask]
             except Exception:
                 pass
-        # 过滤交易时间
-        try:
-            idx_times = data.index.time
-            mask_morning = (idx_times >= dtime(9, 30)) & (idx_times <= dtime(12, 0))
-            mask_afternoon = (idx_times >= dtime(13, 0)) & (idx_times <= dtime(16, 0))
-            mask = mask_morning | mask_afternoon
-            data = data[mask]
-        except Exception:
-            pass
-        
-        minute_data = []
-        for idx, row in data.iterrows():
-            try:
-                t = pd.to_datetime(idx).strftime("%H:%M")
-            except:
-                t = str(idx)
-            try:
-                h = float(row["High"])
-                l = float(row["Low"])
-                c = float(row["Close"])
-                v = int(row["Volume"]) if not np.isnan(row["Volume"]) else 0
-            except Exception:
-                r = {k.lower(): v for k, v in dict(row).items()}
-                h = float(r.get("high", np.nan))
-                l = float(r.get("low", np.nan))
-                c = float(r.get("close", np.nan))
-                v = int(r.get("volume", 0) if not np.isnan(r.get("volume", 0)) else 0)
-            minute_data.append({"time": t, "high": round(h, 6), "low": round(l, 6), "close": round(c, 6), "volume": int(v)})
-        return minute_data
-    except Exception as e:
-        st.error(f"从雅虎财经获取数据失败: {e}")
-        return []
+            
+            minute_data = []
+            for idx, row in data.iterrows():
+                try:
+                    t = pd.to_datetime(idx).strftime("%H:%M")
+                except:
+                    t = str(idx)
+                try:
+                    h = safe_float_conversion(row.get("High", np.nan))
+                    l = safe_float_conversion(row.get("Low", np.nan))
+                    c = safe_float_conversion(row.get("Close", np.nan))
+                    v = safe_int_conversion(row.get("Volume", 0))
+                except Exception:
+                    r = {k.lower(): v for k, v in dict(row).items()}
+                    h = safe_float_conversion(r.get("high", np.nan))
+                    l = safe_float_conversion(r.get("low", np.nan))
+                    c = safe_float_conversion(r.get("close", np.nan))
+                    v = safe_int_conversion(r.get("volume", 0))
+                
+                if not np.isnan(h) and not np.isnan(l) and not np.isnan(c):
+                    minute_data.append({
+                        "time": t, 
+                        "high": round(h, 6), 
+                        "low": round(l, 6), 
+                        "close": round(c, 6), 
+                        "volume": int(v)
+                    })
+            
+            return minute_data
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                st.error(f"获取 {etf_code} 数据失败: {e}")
+                return []
+            else:
+                st.warning(f"第 {attempt + 1} 次获取数据失败，正在重试...")
+                time.sleep(1)
+    
+    return []
+
+def validate_minute_data(minute_data):
+    """验证分钟数据质量"""
+    if not minute_data:
+        return False, "数据为空"
+    
+    issues = []
+    
+    # 检查数据点数量
+    if len(minute_data) < 10:
+        issues.append(f"数据点过少: {len(minute_data)}")
+    
+    # 检查价格合理性
+    prices = [d['close'] for d in minute_data]
+    if max(prices) / min(prices) > 1.5:  # 价格波动过大
+        issues.append("价格波动异常")
+    
+    # 检查成交量
+    volumes = [d['volume'] for d in minute_data]
+    if sum(volumes) == 0:
+        issues.append("成交量为零")
+    
+    if issues:
+        return False, "; ".join(issues)
+    else:
+        return True, "数据质量良好"
 
 def generate_default_minute_data(current_price=27.5, interval=5):
     """生成模拟分钟数据"""
@@ -372,20 +454,26 @@ def calculate_vwap(minute_data):
         return None
     return round(float((prices * volumes).sum() / volumes.sum()), 6)
 
-def calculate_rsi(prices, period=14):
-    """计算相对强弱指数(RSI)"""
+def calculate_rsi_optimized(prices, period=14):
+    """优化版的RSI计算"""
     if len(prices) < period:
-        return [50] * len(prices)
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
+        return np.full(len(prices), 50)
     
-    avg_gains = pd.Series(gains).rolling(period).mean()
-    avg_losses = pd.Series(losses).rolling(period).mean()
+    prices_series = pd.Series(prices)
+    delta = prices_series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
     
-    rs = avg_gains / avg_losses
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    
+    rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    return [50] + rsi.fillna(50).tolist()
+    return rsi.fillna(50).tolist()
+
+def calculate_rsi(prices, period=14):
+    """计算相对强弱指数(RSI) - 兼容旧版本"""
+    return calculate_rsi_optimized(prices, period)
 
 def calculate_obv(prices, volumes):
     """计算能量潮(OBV)"""
@@ -402,6 +490,40 @@ def calculate_obv(prices, volumes):
             obv.append(obv[-1])
     
     return obv
+
+# ---------------------------
+# 风险管理模块
+# ---------------------------
+
+class RiskManager:
+    """风险管理器"""
+    
+    def __init__(self, max_daily_loss_pct=2.0, max_position_pct=50.0):
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.max_position_pct = max_position_pct
+        self.daily_pnl = 0.0
+        self.trade_count = 0
+        
+    def check_trade_approval(self, trade_type, amount, current_position, total_capital):
+        """检查交易是否被批准"""
+        # 仓位限制检查
+        proposed_position = current_position + (amount if trade_type == 'buy' else -amount)
+        position_pct = (proposed_position / total_capital) * 100
+        
+        if position_pct > self.max_position_pct:
+            return False, f"仓位超过限制: {position_pct:.1f}% > {self.max_position_pct}%"
+        
+        return True, "批准交易"
+    
+    def update_daily_pnl(self, pnl):
+        """更新每日盈亏"""
+        self.daily_pnl += pnl
+        self.trade_count += 1
+        
+    def is_daily_loss_limit_reached(self, total_capital):
+        """检查是否达到每日亏损限制"""
+        loss_pct = abs(self.daily_pnl) / total_capital * 100
+        return loss_pct >= self.max_daily_loss_pct and self.daily_pnl < 0
 
 # ---------------------------
 # 智能网格生成函数
@@ -613,7 +735,9 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
 
     for i, row in enumerate(minute_data):
         t = row["time"]
-        high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+        high = safe_float_conversion(row["high"])
+        low = safe_float_conversion(row["low"])
+        close = safe_float_conversion(row["close"])
         
         # 波动率过滤
         if volatility_filter and i >= 10:
@@ -814,6 +938,72 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
     }
 
 # ---------------------------
+# 参数优化模块
+# ---------------------------
+
+def optimize_grid_parameters(principal, minute_data, cfg, param_ranges):
+    """网格参数优化"""
+    best_params = None
+    best_profit = -float('inf')
+    results = []
+    
+    with st.expander("参数优化进度"):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total_combinations = (
+            len(param_ranges['spacing_pct']) * 
+            len(param_ranges['grid_count']) * 
+            len(param_ranges['max_position_pct'])
+        )
+        current_combination = 0
+        
+        for spacing in param_ranges['spacing_pct']:
+            for grid_count in param_ranges['grid_count']:
+                for position_pct in param_ranges['max_position_pct']:
+                    current_combination += 1
+                    progress = current_combination / total_combinations
+                    progress_bar.progress(progress)
+                    status_text.text(f"测试参数组合 {current_combination}/{total_combinations}")
+                    
+                    # 生成网格并回测
+                    current_price = minute_data[-1]['close'] if minute_data else cfg.get('current_price', 27.5)
+                    buy_grids, sell_grids = generate_intraday_grid_arithmetic(
+                        current_price, spacing, grid_count,
+                        current_price * 1.05, current_price * 0.95
+                    )
+                    
+                    # 更新配置
+                    test_cfg = cfg.copy()
+                    test_cfg['max_position_pct'] = position_pct / 100.0
+                    
+                    result = backtest_intraday_strategy_improved(
+                        principal, current_price, buy_grids, sell_grids, minute_data, test_cfg
+                    )
+                    
+                    results.append({
+                        'spacing_pct': spacing,
+                        'grid_count': grid_count,
+                        'max_position_pct': position_pct,
+                        'profit_rate': result['profit_rate'],
+                        'max_drawdown': result['max_drawdown'],
+                        'sharpe_ratio': result['metrics'].get('sharpe', 0)
+                    })
+                    
+                    if result['profit_rate'] > best_profit:
+                        best_profit = result['profit_rate']
+                        best_params = {
+                            'spacing_pct': spacing,
+                            'grid_count': grid_count,
+                            'max_position_pct': position_pct
+                        }
+        
+        progress_bar.empty()
+        status_text.empty()
+    
+    return best_params, pd.DataFrame(results)
+
+# ---------------------------
 # 敏感性分析和ETF对比
 # ---------------------------
 
@@ -927,157 +1117,213 @@ def generate_trading_signals(minute_data, buy_grids, sell_grids, current_price):
     return signals
 
 # ---------------------------
+# 配置管理功能
+# ---------------------------
+
+def save_configuration(cfg, filename=None):
+    """保存配置到文件"""
+    if filename is None:
+        filename = f"grid_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    try:
+        # 转换numpy类型为Python原生类型
+        cfg_serializable = {}
+        for key, value in cfg.items():
+            if hasattr(value, 'item'):  # numpy类型
+                cfg_serializable[key] = value.item()
+            else:
+                cfg_serializable[key] = value
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(cfg_serializable, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        st.error(f"保存配置失败: {e}")
+        return False
+
+def load_configuration(uploaded_file):
+    """从文件加载配置"""
+    try:
+        cfg = json.load(uploaded_file)
+        return cfg
+    except Exception as e:
+        st.error(f"加载配置失败: {e}")
+        return None
+
+# ---------------------------
 # 侧边栏参数设置（优化版）
 # ---------------------------
 
 def render_sidebar():
     st.sidebar.header("🎯 参数与风控设置")
     
-    # 基本信息
-    st.sidebar.subheader("📋 基本信息")
-    principal_str = st.sidebar.text_input("交易本金（港元）", value="100000", 
-                                        help="总投入本金。例如100000。新手建议 50,000-200,000 HKD")
-    try:
-        principal = float(principal_str)
-    except:
-        principal = 100000.0
+    # 使用选项卡组织侧边栏
+    tab_basic, tab_advanced, tab_risk, tab_config = st.sidebar.tabs(["基本", "高级", "风控", "配置"])
+    
+    with tab_basic:
+        # 基本信息
+        st.subheader("📋 基本信息")
+        principal_str = st.text_input("交易本金（港元）", value="100000", 
+                                    help="总投入本金。例如100000。新手建议 50,000-200,000 HKD")
+        try:
+            principal = float(principal_str)
+        except:
+            principal = 100000.0
+            
+        etf_code = st.text_input("ETF 代码（雅虎财经）", value="2800.HK", 
+                               help="雅虎财经的代码，例如 2800.HK、3033.HK")
         
-    etf_code = st.sidebar.text_input("ETF 代码（雅虎财经）", value="2800.HK", 
-                                   help="雅虎财经的代码，例如 2800.HK、3033.HK")
-    
-    current_price_str = st.sidebar.text_input("当前价格（港元）", value="27.5", 
-                                            help="ETF 当前价格，完整输入小数，例如 6.03")
-    try:
-        current_price = float(current_price_str)
-    except:
-        current_price = 27.5
+        current_price_str = st.text_input("当前价格（港元）", value="27.5", 
+                                        help="ETF 当前价格，完整输入小数，例如 6.03")
+        try:
+            current_price = float(current_price_str)
+        except:
+            current_price = 27.5
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 成交额 & 滑点")
-    
-    # 成交额设置
-    turnover_mode = st.sidebar.radio("日均成交额来源", ["自动获取", "手动输入"], horizontal=True)
-    if turnover_mode == "自动获取":
-        turnover_days = st.sidebar.selectbox("取多少日均成交额", [5, 10, 20, 60], index=2)
-        avg_daily_turnover = get_avg_turnover(etf_code, days=turnover_days)
-        if avg_daily_turnover:
-            st.sidebar.success(f"过去 {turnover_days} 日均成交额：{avg_daily_turnover:,.0f} 港元")
+        st.markdown("---")
+        st.subheader("📊 成交额 & 滑点")
+        
+        # 成交额设置
+        turnover_mode = st.radio("日均成交额来源", ["自动获取", "手动输入"], horizontal=True)
+        if turnover_mode == "自动获取":
+            turnover_days = st.selectbox("取多少日均成交额", [5, 10, 20, 60], index=2)
+            avg_daily_turnover = get_avg_turnover(etf_code, days=turnover_days)
+            if avg_daily_turnover:
+                st.success(f"过去 {turnover_days} 日均成交额：{avg_daily_turnover:,.0f} 港元")
+            else:
+                turnover_str = st.text_input("日均成交额（港元）", value="500000000")
+                try:
+                    avg_daily_turnover = float(turnover_str)
+                except:
+                    avg_daily_turnover = 500_000_000.0
         else:
-            turnover_str = st.sidebar.text_input("日均成交额（港元）", value="500000000")
+            turnover_str = st.text_input("日均成交额（港元）", value="500000000")
             try:
                 avg_daily_turnover = float(turnover_str)
             except:
                 avg_daily_turnover = 500_000_000.0
-    else:
-        turnover_str = st.sidebar.text_input("日均成交额（港元）", value="500000000")
-        try:
-            avg_daily_turnover = float(turnover_str)
-        except:
-            avg_daily_turnover = 500_000_000.0
 
-    # 滑点设置
-    rec_low, rec_mid, rec_high = recommend_slippage_by_turnover(avg_daily_turnover)
-    slippage_pct = st.sidebar.slider("滑点（%）", min_value=0.01, max_value=2.0, value=float(rec_mid), step=0.01,
-                                   help="成交价格偏离预期估计，高流动性0.03%-0.3%，低流动性更高")
-    
-    if st.sidebar.button("应用建议滑点"):
-        slippage_pct = rec_mid
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📈 网格与数据周期")
-    
-    data_interval = st.sidebar.selectbox("数据周期（分钟）", [1, 5, 15], index=1)
-    
-    # 高级网格选项
-    grid_type = st.sidebar.selectbox("网格策略类型", 
-                                   ["标准网格", "动态间距（基于ATR）", "基于波动率（Std）", "自适应网格", "趋势调整网格"],
-                                   help="选择不同的网格生成策略")
-    
-    grid_count = st.sidebar.slider("网格总档数（买+卖）", 8, 40, 16, 2,
-                                 help="网格总档数越高越密集，交易越频繁。新手推荐 12-20")
-    
-    # 动态参数
-    fixed_spacing_pct = None
-    volatility_multiplier = None
-    adaptive_method = None
-    
-    if grid_type == "标准网格":
-        fixed_spacing_pct = st.sidebar.slider("固定间距（%）", 0.1, 1.0, 0.3, 0.05)
-    elif grid_type == "基于波动率（Std）":
-        volatility_multiplier = st.sidebar.slider("波动率间距倍数", 0.1, 2.0, 0.5, 0.1)
-    elif grid_type == "自适应网格":
-        adaptive_method = st.sidebar.selectbox("自适应方法", ["volatility", "volume_weighted", "trend_following"])
-    
-    dynamic_grid_center = st.sidebar.checkbox("动态网格中心（随VWAP/均线移动）", value=False)
-    trend_adjustment = st.sidebar.checkbox("趋势调整网格间距", value=False)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🛡️ 仓位与风控（重要）")
-    
-    # 使用滑块优化输入体验
-    initial_cash_pct = st.sidebar.slider("初始可用现金占本金（%）", 10, 100, 50, 5,
-                                       help="初始用于交易的现金占本金比例。默认50%")
-    initial_cash_pct = initial_cash_pct / 100.0
+        # 滑点设置
+        rec_low, rec_mid, rec_high = recommend_slippage_by_turnover(avg_daily_turnover)
+        slippage_pct = st.slider("滑点（%）", min_value=0.01, max_value=2.0, value=float(rec_mid), step=0.01,
+                               help="成交价格偏离预期估计，高流动性0.03%-0.3%，低流动性更高")
         
-    single_trade_pct = st.sidebar.slider("单次交易金额占本金（%）", 1, 20, 5, 1,
-                                       help="单笔委托最大占本金比例。推荐 2-10%，新手 5%")
-    single_trade_pct = single_trade_pct / 100.0
-        
-    # 修复每手股数输入 - 使用数字输入框，步长为100
-    shares_per_lot = st.sidebar.number_input("每手股数", min_value=1, max_value=10000, value=100, step=100,
-                                           help="香港市场通常一手100股（ETF通常100）。请根据具体ETF调整")
-        
-    max_position_pct = st.sidebar.slider("最大持仓占本金（%）", 10, 100, 50, 5,
-                                       help="单日最大可持仓占本金比例，防止单边风险。新手建议 30%-50%")
-    max_position_pct = max_position_pct / 100.0
+        if st.button("应用建议滑点"):
+            slippage_pct = rec_mid
 
-    # 高级风控参数
-    st.sidebar.markdown("**🎯 止损止盈设置**")
-    col1, col2 = st.sidebar.columns(2)
-    
-    with col1:
-        stop_loss_pct = st.slider("止损（%）", 0.0, 10.0, 0.0, 0.5,
-                                help="当回测净值较初始下跌超过该阈值时触发平仓保护")
-        stop_loss_pct = stop_loss_pct if stop_loss_pct > 0 else None
+    with tab_advanced:
+        st.subheader("📈 网格与数据周期")
         
-    with col2:
-        take_profit_pct = st.slider("止盈（%）", 0.0, 20.0, 0.0, 0.5,
-                                  help="当回测净值较初始上涨超过该阈值时触发止盈平仓")
-        take_profit_pct = take_profit_pct if take_profit_pct > 0 else None
+        data_interval = st.selectbox("数据周期（分钟）", [1, 5, 15], index=1)
+        
+        # 高级网格选项
+        grid_type = st.selectbox("网格策略类型", 
+                               ["标准网格", "动态间距（基于ATR）", "基于波动率（Std）", "自适应网格", "趋势调整网格"],
+                               help="选择不同的网格生成策略")
+        
+        grid_count = st.slider("网格总档数（买+卖）", 8, 40, 16, 2,
+                             help="网格总档数越高越密集，交易越频繁。新手推荐 12-20")
+        
+        # 动态参数
+        fixed_spacing_pct = None
+        volatility_multiplier = None
+        adaptive_method = None
+        
+        if grid_type == "标准网格":
+            fixed_spacing_pct = st.slider("固定间距（%）", 0.1, 1.0, 0.3, 0.05)
+        elif grid_type == "基于波动率（Std）":
+            volatility_multiplier = st.slider("波动率间距倍数", 0.1, 2.0, 0.5, 0.1)
+        elif grid_type == "自适应网格":
+            adaptive_method = st.selectbox("自适应方法", ["volatility", "volume_weighted", "trend_following"])
+        
+        dynamic_grid_center = st.checkbox("动态网格中心（随VWAP/均线移动）", value=False)
+        trend_adjustment = st.checkbox("趋势调整网格间距", value=False)
 
-    # 新增高级风控
-    st.sidebar.markdown("**⚡ 高级风控选项**")
-    
-    trailing_stop_pct = st.sidebar.slider("跟踪止损（%）", 0.0, 5.0, 0.0, 0.1,
-                                        help="从最高点回撤该百分比时触发止损")
-    trailing_stop_pct = trailing_stop_pct if trailing_stop_pct > 0 else None
-    
-    time_based_exit = st.sidebar.slider("时间止损（小时）", 0, 16, 0,
-                                      help="在指定时间强制平仓（0为不启用）")
-    time_based_exit = time_based_exit if time_based_exit > 0 else None
-    
-    volatility_filter = st.sidebar.slider("波动率过滤倍数", 1.0, 3.0, 1.0, 0.1,
-                                        help="当波动率超过初始值倍数时暂停交易")
-    volatility_filter = volatility_filter if volatility_filter > 1.0 else None
+    with tab_risk:
+        st.subheader("🛡️ 仓位与风控（重要）")
+        
+        # 使用滑块优化输入体验
+        initial_cash_pct = st.slider("初始可用现金占本金（%）", 10, 100, 50, 5,
+                                   help="初始用于交易的现金占本金比例。默认50%")
+        initial_cash_pct = initial_cash_pct / 100.0
+            
+        single_trade_pct = st.slider("单次交易金额占本金（%）", 1, 20, 5, 1,
+                                   help="单笔委托最大占本金比例。推荐 2-10%，新手 5%")
+        single_trade_pct = single_trade_pct / 100.0
+            
+        # 修复每手股数输入 - 使用数字输入框，步长为100
+        shares_per_lot = st.number_input("每手股数", min_value=1, max_value=10000, value=100, step=100,
+                                       help="香港市场通常一手100股（ETF通常100）。请根据具体ETF调整")
+            
+        max_position_pct = st.slider("最大持仓占本金（%）", 10, 100, 50, 5,
+                                   help="单日最大可持仓占本金比例，防止单边风险。新手建议 30%-50%")
+        max_position_pct = max_position_pct / 100.0
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💰 扩展费用 & 限制")
-    
-    stamp_duty_pct = st.sidebar.slider("印花税（卖出，%）", 0.0, 1.0, 0.0, 0.01,
-                                     help="卖出时适用的印花税百分比，如适用请填写（ETF通常为0）")
-    
-    financing_interest_pct = st.sidebar.slider("融资利息年化（%）", 0.0, 10.0, 0.0, 0.1,
-                                            help="若回测需要考虑融资融券利息，可在此输入年化利率")
-    
-    max_daily_trades = st.sidebar.slider("单日最大交易次数", 0, 100, 0, 5,
-                                       help="限制每天最大交易笔数以防过度交易。0 表示不限制")
-    max_daily_trades = max_daily_trades if max_daily_trades > 0 else None
-    
-    single_max_loss_pct = st.sidebar.slider("单日最大亏损阈值（%）", 0.0, 10.0, 0.0, 0.5,
-                                          help="当日已实现亏损超过此阈值则强制清仓")
-    single_max_loss_pct = single_max_loss_pct if single_max_loss_pct > 0 else None
-    
-    force_close_end_of_day = st.sidebar.checkbox("收盘强制清仓（只做日内）", value=False)
+        # 高级风控参数
+        st.markdown("**🎯 止损止盈设置**")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            stop_loss_pct = st.slider("止损（%）", 0.0, 10.0, 0.0, 0.5,
+                                    help="当回测净值较初始下跌超过该阈值时触发平仓保护")
+            stop_loss_pct = stop_loss_pct if stop_loss_pct > 0 else None
+            
+        with col2:
+            take_profit_pct = st.slider("止盈（%）", 0.0, 20.0, 0.0, 0.5,
+                                      help="当回测净值较初始上涨超过该阈值时触发止盈平仓")
+            take_profit_pct = take_profit_pct if take_profit_pct > 0 else None
+
+        # 新增高级风控
+        st.markdown("**⚡ 高级风控选项**")
+        
+        trailing_stop_pct = st.slider("跟踪止损（%）", 0.0, 5.0, 0.0, 0.1,
+                                    help="从最高点回撤该百分比时触发止损")
+        trailing_stop_pct = trailing_stop_pct if trailing_stop_pct > 0 else None
+        
+        time_based_exit = st.slider("时间止损（小时）", 0, 16, 0,
+                                  help="在指定时间强制平仓（0为不启用）")
+        time_based_exit = time_based_exit if time_based_exit > 0 else None
+        
+        volatility_filter = st.slider("波动率过滤倍数", 1.0, 3.0, 1.0, 0.1,
+                                    help="当波动率超过初始值倍数时暂停交易")
+        volatility_filter = volatility_filter if volatility_filter > 1.0 else None
+
+        st.markdown("---")
+        st.subheader("💰 扩展费用 & 限制")
+        
+        stamp_duty_pct = st.slider("印花税（卖出，%）", 0.0, 1.0, 0.0, 0.01,
+                                 help="卖出时适用的印花税百分比，如适用请填写（ETF通常为0）")
+        
+        financing_interest_pct = st.slider("融资利息年化（%）", 0.0, 10.0, 0.0, 0.1,
+                                        help="若回测需要考虑融资融券利息，可在此输入年化利率")
+        
+        max_daily_trades = st.slider("单日最大交易次数", 0, 100, 0, 5,
+                                   help="限制每天最大交易笔数以防过度交易。0 表示不限制")
+        max_daily_trades = max_daily_trades if max_daily_trades > 0 else None
+        
+        single_max_loss_pct = st.slider("单日最大亏损阈值（%）", 0.0, 10.0, 0.0, 0.5,
+                                      help="当日已实现亏损超过此阈值则强制清仓")
+        single_max_loss_pct = single_max_loss_pct if single_max_loss_pct > 0 else None
+        
+        force_close_end_of_day = st.checkbox("收盘强制清仓（只做日内）", value=False)
+
+    with tab_config:
+        st.subheader("⚙️ 配置管理")
+        
+        # 配置保存和加载
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 保存配置", use_container_width=True):
+                if save_configuration(st.session_state.get('cfg', {})):
+                    st.success("配置已保存")
+        
+        with col2:
+            uploaded_file = st.file_uploader("📂 加载配置", type=['json'], label_visibility="collapsed")
+            if uploaded_file is not None:
+                loaded_cfg = load_configuration(uploaded_file)
+                if loaded_cfg:
+                    st.session_state.cfg.update(loaded_cfg)
+                    st.success("配置已加载")
 
     # 构建配置字典
     cfg = {
@@ -1112,6 +1358,46 @@ def render_sidebar():
     return principal, etf_code, current_price, cfg, data_interval, grid_type, grid_count, fixed_spacing_pct, avg_daily_turnover
 
 # ---------------------------
+# 主题设置
+# ---------------------------
+
+def setup_theme():
+    """设置应用主题"""
+    st.markdown("""
+    <style>
+    .main {
+        background-color: #f0f2f6;
+    }
+    .stButton>button {
+        width: 100%;
+        border-radius: 5px;
+        border: 1px solid #4CAF50;
+        background-color: #4CAF50;
+        color: white;
+        padding: 0.5rem 1rem;
+    }
+    .stButton>button:hover {
+        background-color: #45a049;
+        border-color: #45a049;
+    }
+    .metric-card {
+        background-color: white;
+        padding: 10px;
+        border-radius: 5px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 5px 0;
+    }
+    .tab-content {
+        padding: 1rem;
+        background-color: white;
+        border-radius: 5px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 10px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ---------------------------
 # 标签页实现
 # ---------------------------
 
@@ -1138,7 +1424,13 @@ def render_tab_data():
             if md:
                 st.session_state.minute_data = md
                 st.session_state.current_price = md[-1]["close"]
-                st.success(f"✅ 已获取 {len(md)} 条分钟数据，当前价 {md[-1]['close']:.4f}")
+                
+                # 数据质量检查
+                is_valid, message = validate_minute_data(md)
+                if is_valid:
+                    st.success(f"✅ 已获取 {len(md)} 条分钟数据，当前价 {md[-1]['close']:.4f}")
+                else:
+                    st.warning(f"⚠️ 数据质量警告: {message}")
             else:
                 st.warning("❌ 未获取到有效数据，可能为休市或代码错误")
     
@@ -1286,7 +1578,7 @@ def render_tab_strategy():
         
         st.info(f"网格覆盖范围: {coverage_low:.4f} - {coverage_high:.4f} (±{coverage_pct/2:.2f}%)")
     
-    # 网格可视化 - 修复版本
+    # 网格可视化
     st.subheader("📊 网格价格分布图")
 
     if buy_grids or sell_grids:
@@ -1788,6 +2080,60 @@ def render_tab_sensitivity():
         fig.update_layout(height=600, showlegend=True)
         st.plotly_chart(fig, use_container_width=True)
 
+def render_tab_optimization():
+    st.subheader("⚡ 网格参数优化")
+    
+    if not st.session_state.get("minute_data"):
+        st.warning("请先获取数据")
+        return
+    
+    # 参数范围设置
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        spacing_range = st.slider("间距范围(%)", 0.1, 1.0, (0.1, 0.5))
+    with col2:
+        grid_range = st.slider("网格数量范围", 8, 30, (10, 20))
+    with col3:
+        position_range = st.slider("仓位范围(%)", 20, 80, (30, 60))
+    
+    # 生成参数组合
+    param_ranges = {
+        'spacing_pct': np.linspace(spacing_range[0], spacing_range[1], 5).tolist(),
+        'grid_count': list(range(grid_range[0], grid_range[1] + 1, 2)),
+        'max_position_pct': list(range(position_range[0], position_range[1] + 1, 10))
+    }
+    
+    if st.button("开始参数优化", type="primary"):
+        best_params, results_df = optimize_grid_parameters(
+            st.session_state.principal,
+            st.session_state.minute_data,
+            st.session_state.cfg,
+            param_ranges
+        )
+        
+        st.session_state.optimization_results = results_df
+        st.session_state.best_params = best_params
+        
+        # 显示优化结果
+        st.success(f"🎯 最优参数: 间距 {best_params['spacing_pct']}%, "
+                  f"网格数 {best_params['grid_count']}, "
+                  f"仓位 {best_params['max_position_pct']}%")
+        
+        # 可视化结果
+        fig = px.scatter_3d(
+            results_df, 
+            x='spacing_pct', 
+            y='grid_count', 
+            z='profit_rate',
+            color='max_drawdown',
+            title='参数优化结果'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 显示详细结果
+        st.subheader("详细优化结果")
+        st.dataframe(results_df.sort_values('profit_rate', ascending=False), use_container_width=True)
+
 def render_tab_etf_compare():
     st.subheader("📊 多ETF日内T+0效果对比")
     
@@ -2079,6 +2425,9 @@ def main():
         initial_sidebar_state="expanded"
     )
     
+    # 设置主题
+    setup_theme()
+    
     # 应用标题和介绍
     st.title("📈 ETF日内T+0网格交易策略 - 增强专业版")
     st.markdown("""
@@ -2108,7 +2457,9 @@ def main():
             "minute_data": [],
             "buy_grids": [],
             "sell_grids": [],
-            "backtest_result": None
+            "backtest_result": None,
+            "risk_manager": RiskManager(),
+            "optimization_results": None
         })
     else:
         # 更新参数
@@ -2139,7 +2490,7 @@ def main():
     
     # 标签页配置
     tabs = st.tabs([
-        "📊 数据", "🎯 策略", "📈 回测", "🔬 高级分析", "📋 参数分析", 
+        "📊 数据", "🎯 策略", "📈 回测", "🔬 高级分析", "⚡ 参数优化", 
         "📊 ETF对比", "📈 趋势指标", "🔔 策略信号", "🕒 交易时间", "👨‍🏫 新手指南"
     ])
     
@@ -2152,7 +2503,7 @@ def main():
     with tabs[3]:
         render_tab_advanced_analysis()
     with tabs[4]:
-        render_tab_sensitivity()
+        render_tab_optimization()
     with tabs[5]:
         render_tab_etf_compare()
     with tabs[6]:
