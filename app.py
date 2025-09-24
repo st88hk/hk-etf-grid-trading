@@ -364,6 +364,8 @@ def calculate_atr(highs, lows, closes, period=14):
 
 def calculate_vwap(minute_data):
     """计算成交量加权平均价(VWAP)"""
+    if not minute_data:
+        return None
     prices = np.array([d["close"] for d in minute_data], dtype=float)
     volumes = np.array([d["volume"] for d in minute_data], dtype=float)
     if volumes.sum() == 0:
@@ -810,6 +812,7 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
         "holdings_history": holdings_history,
         "metrics": metrics
     }
+
 # ---------------------------
 # 敏感性分析和ETF对比
 # ---------------------------
@@ -866,6 +869,62 @@ def compare_etfs(etf_codes, principal, data_interval, cfg):
             })
     return pd.DataFrame(comparison)
 
+# ---------------------------
+# 实时交易信号系统
+# ---------------------------
+
+def generate_trading_signals(minute_data, buy_grids, sell_grids, current_price):
+    """生成实时交易信号"""
+    signals = []
+    
+    if not minute_data or not buy_grids or not sell_grids:
+        return signals
+    
+    # 价格与网格关系信号
+    closest_buy = min(buy_grids, key=lambda x: abs(x - current_price)) if buy_grids else None
+    closest_sell = min(sell_grids, key=lambda x: abs(x - current_price)) if sell_grids else None
+    
+    if closest_buy and current_price <= closest_buy * 1.001:  # 接近买入网格
+        distance_pct = (closest_buy - current_price) / current_price * 100
+        signals.append(("🟢", f"接近买入网格: {closest_buy:.4f} (距离: {distance_pct:.2f}%)"))
+    
+    if closest_sell and current_price >= closest_sell * 0.999:  # 接近卖出网格
+        distance_pct = (current_price - closest_sell) / current_price * 100
+        signals.append(("🔴", f"接近卖出网格: {closest_sell:.4f} (距离: {distance_pct:.2f}%)"))
+    
+    # 技术指标信号
+    closes = [d['close'] for d in minute_data]
+    
+    # RSI信号
+    if len(closes) >= 14:
+        rsi_values = calculate_rsi(closes)
+        current_rsi = rsi_values[-1] if rsi_values else 50
+        
+        if current_rsi < 30:
+            signals.append(("🟢", f"RSI超卖: {current_rsi:.1f} (买入机会)"))
+        elif current_rsi > 70:
+            signals.append(("🔴", f"RSI超买: {current_rsi:.1f} (卖出机会)"))
+    
+    # 移动平均信号
+    if len(closes) >= 20:
+        ma_short = sum(closes[-5:]) / 5
+        ma_long = sum(closes[-20:]) / 20
+        
+        if ma_short > ma_long:
+            signals.append(("🟢", "短期均线上穿长期均线 (看涨)"))
+        else:
+            signals.append(("🔴", "短期均线下穿长期均线 (看跌)"))
+    
+    # 成交量信号
+    volumes = [d['volume'] for d in minute_data]
+    if len(volumes) >= 5:
+        avg_volume = sum(volumes[:-1]) / (len(volumes) - 1)
+        current_volume = volumes[-1]
+        
+        if current_volume > avg_volume * 1.5:
+            signals.append(("🔔", f"成交量放大: {current_volume/avg_volume:.1f}倍"))
+    
+    return signals
 
 # ---------------------------
 # 侧边栏参数设置（优化版）
@@ -1100,6 +1159,26 @@ def render_tab_data():
         st.subheader("数据预览")
         st.dataframe(df, height=300, use_container_width=True)
         
+        # 数据质量检查
+        st.subheader("📋 数据质量检查")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            data_points = len(df)
+            st.metric("数据点数", data_points)
+        
+        with col2:
+            time_range = f"{df['time'].iloc[0]} - {df['time'].iloc[-1]}" if data_points > 0 else "无数据"
+            st.metric("时间范围", time_range)
+        
+        with col3:
+            price_range = f"{df['close'].max():.4f} - {df['close'].min():.4f}" if data_points > 0 else "无数据"
+            st.metric("价格范围", price_range)
+        
+        with col4:
+            volume_avg = f"{df['volume'].mean():.0f}" if data_points > 0 else "无数据"
+            st.metric("平均成交量", volume_avg)
+        
         # 价格图表
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df['time'], y=df['close'], name='收盘价', 
@@ -1173,7 +1252,8 @@ def render_tab_strategy():
         st.write("**买入网格**")
         if buy_grids:
             for i, price in enumerate(buy_grids):
-                st.write(f"{i+1}. {price:.4f} ({((current_price - price)/current_price*100):.2f}%)")
+                discount_pct = ((current_price - price) / current_price * 100)
+                st.write(f"{i+1}. {price:.4f} (-{discount_pct:.2f}%)")
         else:
             st.write("无买入网格")
     
@@ -1181,7 +1261,8 @@ def render_tab_strategy():
         st.write("**卖出网格**")
         if sell_grids:
             for i, price in enumerate(sell_grids):
-                st.write(f"{i+1}. {price:.4f} ({((price - current_price)/current_price*100):.2f}%)")
+                premium_pct = ((price - current_price) / current_price * 100)
+                st.write(f"{i+1}. {price:.4f} (+{premium_pct:.2f}%)")
         else:
             st.write("无卖出网格")
     
@@ -1228,13 +1309,13 @@ def render_tab_strategy():
         # 买入网格线（绿色）
         for i, price in enumerate(buy_grids):
             fig.add_hline(y=price, line_color="green", line_width=2,
-                         annotation_text=f"买入{i+1}: {price:.4f}", 
+                         annotation_text=f"B{i+1}", 
                          annotation_position="bottom left")
         
         # 卖出网格线（蓝色）
         for i, price in enumerate(sell_grids):
             fig.add_hline(y=price, line_color="blue", line_width=2,
-                         annotation_text=f"卖出{i+1}: {price:.4f}", 
+                         annotation_text=f"S{i+1}", 
                          annotation_position="top right")
         
         # 添加一些虚拟数据点以确保图表正确显示
@@ -1266,7 +1347,7 @@ def render_tab_backtest():
         st.warning("请先获取数据并生成网格")
         return
     
-    if st.button("开始回测"):
+    if st.button("开始回测", type="primary"):
         with st.spinner("回测中..."):
             result = backtest_intraday_strategy_improved(
                 st.session_state.principal,
@@ -1280,57 +1361,142 @@ def render_tab_backtest():
             st.session_state.backtest_result = result
             
             # 显示回测结果
-            col1, col2, col3 = st.columns(3)
+            st.subheader("📊 回测结果概览")
+            col1, col2, col3, col4 = st.columns(4)
             
             with col1:
-                st.metric("最终净值", f"{result['final_total_value']:,.2f}")
-                st.metric("总利润", f"{result['total_profit']:,.2f}")
+                st.metric("最终净值", f"${result['final_total_value']:,.2f}")
+                st.metric("总利润", f"${result['total_profit']:,.2f}")
             
             with col2:
-                st.metric("收益率", f"{result['profit_rate']:.2f}%")
+                profit_color = "normal" if result['profit_rate'] >= 0 else "inverse"
+                st.metric("收益率", f"{result['profit_rate']:.2f}%", delta=f"{result['profit_rate']:.2f}%")
                 st.metric("最大回撤", f"{result['max_drawdown']:.2f}%")
             
             with col3:
                 st.metric("买入次数", result['total_buy_count'])
                 st.metric("卖出次数", result['total_sell_count'])
             
+            with col4:
+                st.metric("平均交易利润", f"${result['avg_trade_profit']:.2f}")
+                total_trades = result['total_buy_count'] + result['total_sell_count']
+                st.metric("总交易次数", total_trades)
+            
             # 风险指标
             if result['metrics']:
-                st.subheader("📊 风险指标")
+                st.subheader("📈 风险指标")
                 metrics = result['metrics']
                 col1, col2, col3, col4 = st.columns(4)
                 
                 if metrics.get('sharpe') is not None:
-                    col1.metric("夏普比率", f"{metrics['sharpe']:.2f}")
+                    sharpe_color = "normal" if metrics['sharpe'] > 1 else "inverse"
+                    col1.metric("夏普比率", f"{metrics['sharpe']:.2f}", delta=metrics['sharpe'], delta_color=sharpe_color)
+                
                 if metrics.get('calmar') is not None:
-                    col2.metric("卡尔玛比率", f"{metrics['calmar']:.2f}")
+                    calmar_color = "normal" if metrics['calmar'] > 1 else "inverse"
+                    col2.metric("卡尔玛比率", f"{metrics['calmar']:.2f}", delta=metrics['calmar'], delta_color=calmar_color)
+                
                 if metrics.get('win_rate') is not None:
-                    col3.metric("胜率", f"{metrics['win_rate']:.1f}%")
+                    winrate_color = "normal" if metrics['win_rate'] > 50 else "inverse"
+                    col3.metric("胜率", f"{metrics['win_rate']:.1f}%", delta=f"{metrics['win_rate']:.1f}%", delta_color=winrate_color)
+                
                 if metrics.get('profit_factor') is not None:
-                    col4.metric("盈亏比", f"{metrics['profit_factor']:.2f}")
+                    pf_color = "normal" if metrics['profit_factor'] > 1 else "inverse"
+                    col4.metric("盈亏比", f"{metrics['profit_factor']:.2f}", delta=metrics['profit_factor'], delta_color=pf_color)
             
             # 净值曲线
+            st.subheader("📈 净值曲线")
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=result['timestamps'], 
                 y=result['net_values'],
                 mode='lines',
-                name='净值'
+                name='净值',
+                line=dict(color='blue', width=2)
             ))
+            
+            # 添加初始本金线
+            fig.add_hline(y=st.session_state.principal, line_dash="dash", 
+                         line_color="red", annotation_text="初始本金")
+            
             fig.update_layout(
                 title="净值曲线",
                 xaxis_title="时间",
-                yaxis_title="净值"
+                yaxis_title="净值（港元）",
+                height=400
             )
             st.plotly_chart(fig, use_container_width=True)
             
+            # 持仓变化
+            st.subheader("📊 持仓变化")
+            fig_holding = go.Figure()
+            fig_holding.add_trace(go.Scatter(
+                x=result['timestamps'],
+                y=result['holdings_history'],
+                mode='lines',
+                name='持仓数量',
+                line=dict(color='orange', width=2)
+            ))
+            fig_holding.update_layout(
+                title="持仓数量变化",
+                xaxis_title="时间",
+                yaxis_title="持仓数量",
+                height=300
+            )
+            st.plotly_chart(fig_holding, use_container_width=True)
+            
             # 交易记录
-            st.subheader("交易记录")
+            st.subheader("📋 交易记录")
             if result['trade_records']:
                 trades_df = pd.DataFrame(result['trade_records'])
-                st.dataframe(trades_df, use_container_width=True)
+                
+                # 添加交易类型颜色
+                def color_trade_type(trade_type):
+                    if trade_type == 'buy':
+                        return 'color: green'
+                    elif 'sell' in trade_type:
+                        return 'color: red'
+                    else:
+                        return ''
+                
+                styled_df = trades_df.style.applymap(color_trade_type, subset=['type'])
+                st.dataframe(styled_df, use_container_width=True, height=400)
+                
+                # 交易统计
+                st.subheader("📈 交易统计分析")
+                trade_types = trades_df['type'].value_counts()
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**交易类型分布**")
+                    fig_pie = go.Figure(data=[go.Pie(
+                        labels=trade_types.index,
+                        values=trade_types.values,
+                        hole=.3
+                    )])
+                    fig_pie.update_layout(height=300)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                
+                with col2:
+                    st.write("**交易时间分布**")
+                    # 提取小时信息
+                    trades_df['hour'] = trades_df['time'].str.split(':').str[0].astype(int)
+                    hour_dist = trades_df['hour'].value_counts().sort_index()
+                    
+                    fig_bar = go.Figure(data=[go.Bar(
+                        x=hour_dist.index,
+                        y=hour_dist.values,
+                        marker_color='lightblue'
+                    )])
+                    fig_bar.update_layout(
+                        xaxis_title="小时",
+                        yaxis_title="交易次数",
+                        height=300
+                    )
+                    st.plotly_chart(fig_bar, use_container_width=True)
             else:
-                st.write("无交易记录")
+                st.info("本次回测没有产生交易记录")
 
 def render_tab_advanced_analysis():
     st.subheader("🔬 高级技术分析")
@@ -1345,6 +1511,9 @@ def render_tab_advanced_analysis():
     lows = df['low'].tolist()
     volumes = df['volume'].tolist()
     
+    # 确保 current_price 有值
+    current_price = st.session_state.current_price if hasattr(st.session_state, 'current_price') else (closes[-1] if closes else 0)
+    
     # MACD分析
     st.subheader("📊 MACD指标")
     macd, signal, histogram = calculate_macd(closes)
@@ -1353,27 +1522,43 @@ def render_tab_advanced_analysis():
         col1, col2, col3 = st.columns(3)
         col1.metric("MACD", f"{macd:.4f}")
         col2.metric("信号线", f"{signal:.4f}")
-        col3.metric("柱状图", f"{histogram:.4f}")
         
-        # MACD图表
-        fig_macd = go.Figure()
-        fig_macd.add_trace(go.Scatter(x=df['time'], y=closes, name="价格", line=dict(color='black')))
-        fig_macd.update_layout(height=300, title="价格走势与MACD分析")
-        st.plotly_chart(fig_macd, use_container_width=True)
+        # MACD柱状图颜色
+        hist_color = 'normal' if histogram > 0 else 'inverse'
+        col3.metric("柱状图", f"{histogram:.4f}", delta=f"{histogram:.4f}", delta_color=hist_color)
+        
+        # MACD信号解释
+        if macd > signal and histogram > 0:
+            st.success("📈 MACD金叉，看涨信号")
+        elif macd < signal and histogram < 0:
+            st.error("📉 MACD死叉，看跌信号")
+        else:
+            st.info("⚖️ MACD中性，观望信号")
     
     # 布林带分析
     st.subheader("📈 布林带分析")
     upper_bb, middle_bb, lower_bb = calculate_bollinger_bands(closes)
     
-    if upper_bb is not None:
-        current_price = closes[-1]
+    if upper_bb is not None and current_price > 0:
         bb_position = (current_price - lower_bb) / (upper_bb - lower_bb) * 100
         
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("上轨", f"{upper_bb:.4f}")
         col2.metric("中轨", f"{middle_bb:.4f}")
         col3.metric("下轨", f"{lower_bb:.4f}")
-        col4.metric("位置%", f"{bb_position:.1f}%")
+        
+        # 布林带位置信号
+        if bb_position > 80:
+            position_status = "超买区域"
+            position_color = "inverse"
+        elif bb_position < 20:
+            position_status = "超卖区域"
+            position_color = "normal"
+        else:
+            position_status = "正常区域"
+            position_color = "off"
+        
+        col4.metric("位置%", f"{bb_position:.1f}%", position_status, delta_color=position_color)
         
         # 布林带图表
         fig_bb = go.Figure()
@@ -1397,25 +1582,45 @@ def render_tab_advanced_analysis():
         col5.metric("延迟线", f"{ichimoku['chikou']:.4f}" if ichimoku['chikou'] else "N/A")
         
         # 云图分析
-        current_price = closes[-1]
-        if ichimoku['senkou_a'] and ichimoku['senkou_b']:
-            if current_price > max(ichimoku['senkou_a'], ichimoku['senkou_b']):
+        if ichimoku['senkou_a'] and ichimoku['senkou_b'] and current_price > 0:
+            cloud_top = max(ichimoku['senkou_a'], ichimoku['senkou_b'])
+            cloud_bottom = min(ichimoku['senkou_a'], ichimoku['senkou_b'])
+            
+            if current_price > cloud_top:
                 st.success("📈 价格在云层之上 - 强势信号")
-            elif current_price < min(ichimoku['senkou_a'], ichimoku['senkou_b']):
+            elif current_price < cloud_bottom:
                 st.error("📉 价格在云层之下 - 弱势信号")
             else:
                 st.warning("☁️ 价格在云层之中 - 震荡行情")
+                
+            # 转换线与基准线关系
+            if ichimoku['tenkan'] > ichimoku['kijun']:
+                st.info("↑ 转换线在基准线之上 - 短期看涨")
+            else:
+                st.info("↓ 转换线在基准线之下 - 短期看跌")
 
     # ATR波动率分析
     st.subheader("📊 ATR波动率分析")
     atr_values = calculate_atr(highs, lows, closes)
-    if atr_values:
+    if atr_values and current_price > 0:
         current_atr = atr_values[-1]
         atr_percent = (current_atr / current_price) * 100
         
         col1, col2 = st.columns(2)
         col1.metric("ATR(14)", f"{current_atr:.4f}")
-        col2.metric("ATR%", f"{atr_percent:.2f}%")
+        
+        # ATR百分比评估
+        if atr_percent < 1:
+            atr_status = "低波动"
+            atr_color = "normal"
+        elif atr_percent > 3:
+            atr_status = "高波动"
+            atr_color = "inverse"
+        else:
+            atr_status = "正常波动"
+            atr_color = "off"
+            
+        col2.metric("ATR%", f"{atr_percent:.2f}%", atr_status, delta_color=atr_color)
         
         # ATR图表
         fig_atr = go.Figure()
@@ -1426,17 +1631,16 @@ def render_tab_advanced_analysis():
     # OBV能量潮分析
     st.subheader("🌊 OBV能量潮")
     obv_values = calculate_obv(closes, volumes)
-    if obv_values:
+    if obv_values and len(obv_values) > 5:
         current_obv = obv_values[-1]
-    
+        prev_obv = obv_values[-5]
+        
         # 修复趋势判断逻辑
-        if len(obv_values) > 5:
-            obv_trend = "上升" if current_obv > obv_values[-5] else "下降"
-        else:
-            obv_trend = "数据不足"
-    
-        st.metric("OBV", f"{current_obv:,.0f}", obv_trend)
-    
+        obv_trend = "上升" if current_obv > prev_obv else "下降"
+        obv_change = ((current_obv - prev_obv) / abs(prev_obv) * 100) if prev_obv != 0 else 0
+        
+        st.metric("OBV", f"{current_obv:,.0f}", f"{obv_trend} ({obv_change:.1f}%)")
+        
         # OBV图表
         fig_obv = go.Figure()
         fig_obv.add_trace(go.Scatter(x=df['time'], y=obv_values, name="OBV", line=dict(color='orange')))
@@ -1445,21 +1649,28 @@ def render_tab_advanced_analysis():
     
     # 斐波那契回撤
     st.subheader("🔺 斐波那契回撤水平")
-    if len(highs) > 0 and len(lows) > 0:
+    if len(highs) > 0 and len(lows) > 0 and current_price > 0:
         recent_high = max(highs[-20:])  # 最近20期最高价
         recent_low = min(lows[-20:])    # 最近20期最低价
-        fib_levels = calculate_fibonacci_levels(recent_high, recent_low)
         
-        fib_df = pd.DataFrame(list(fib_levels.items()), columns=['水平', '价格'])
-        st.dataframe(fib_df, use_container_width=True)
-        
-        # 斐波那契图表
-        fig_fib = go.Figure()
-        fig_fib.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价"))
-        for level, price in fib_levels.items():
-            fig_fib.add_hline(y=price, line_dash="dash", annotation_text=level)
-        fig_fib.update_layout(height=400, title="斐波那契回撤水平")
-        st.plotly_chart(fig_fib, use_container_width=True)
+        if recent_high > recent_low:  # 确保高低点有效
+            fib_levels = calculate_fibonacci_levels(recent_high, recent_low)
+            
+            # 找到最接近的斐波那契水平
+            closest_level = min(fib_levels.items(), key=lambda x: abs(x[1] - current_price))
+            
+            st.info(f"当前价格最接近 {closest_level[0]} 水平: {closest_level[1]:.4f}")
+            
+            fib_df = pd.DataFrame(list(fib_levels.items()), columns=['水平', '价格'])
+            st.dataframe(fib_df, use_container_width=True)
+            
+            # 斐波那契图表
+            fig_fib = go.Figure()
+            fig_fib.add_trace(go.Scatter(x=df['time'], y=df['close'], name="收盘价"))
+            for level, price in fib_levels.items():
+                fig_fib.add_hline(y=price, line_dash="dash", annotation_text=level)
+            fig_fib.update_layout(height=400, title="斐波那契回撤水平")
+            st.plotly_chart(fig_fib, use_container_width=True)
     
     # 支撑阻力分析
     st.subheader("⚖️ 自动支撑阻力分析")
@@ -1469,12 +1680,20 @@ def render_tab_advanced_analysis():
     with col1:
         st.write("**支撑位**")
         for level in support_levels[:3]:  # 只显示前3个
-            st.write(f"- {level:.4f}")
+            if current_price > 0:
+                distance_pct = ((current_price - level) / current_price * 100)
+                st.write(f"- {level:.4f} (距离: {distance_pct:.2f}%)")
+            else:
+                st.write(f"- {level:.4f}")
     
     with col2:
         st.write("**阻力位**")
         for level in resistance_levels[:3]:  # 只显示前3个
-            st.write(f"- {level:.4f}")
+            if current_price > 0:
+                distance_pct = ((level - current_price) / current_price * 100)
+                st.write(f"- {level:.4f} (距离: {distance_pct:.2f}%)")
+            else:
+                st.write(f"- {level:.4f}")
     
     # 价格预测
     st.subheader("🔮 简单价格预测")
@@ -1487,7 +1706,12 @@ def render_tab_advanced_analysis():
     
     # 趋势强度分析
     trend_strength = calculate_price_trend(st.session_state.minute_data)
-    st.metric("趋势强度", f"{trend_strength:.2f}")
+    if abs(trend_strength) > 1:
+        trend_color = "normal" if trend_strength > 0 else "inverse"
+        st.metric("趋势强度", f"{trend_strength:.2f}", 
+                 delta=f"{trend_strength:.2f}", delta_color=trend_color)
+    else:
+        st.metric("趋势强度", f"{trend_strength:.2f}")
 
 def render_tab_sensitivity():
     st.subheader("🔬 网格参数敏感性分析")
@@ -1621,6 +1845,10 @@ def render_tab_etf_compare():
                 height=400
             )
             st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            # 推荐最佳ETF
+            best_etf = comparison_df.loc[comparison_df["收益(%)"].idxmax()]
+            st.success(f"🎯 推荐最佳ETF: {best_etf['ETF代码']} (收益: {best_etf['收益(%)']:.2f}%)")
         else:
             st.warning("❌ 未能获取任何ETF的数据，请检查代码是否正确")
 
@@ -1640,16 +1868,46 @@ def render_tab_indicators():
     current_rsi = rsi_values[-1] if rsi_values else 50
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("RSI", f"{current_rsi:.1f}")
+    
+    # RSI状态
+    if current_rsi < 30:
+        rsi_status = "超卖"
+        rsi_color = "normal"
+    elif current_rsi > 70:
+        rsi_status = "超买"
+        rsi_color = "inverse"
+    else:
+        rsi_status = "正常"
+        rsi_color = "off"
+    
+    col1.metric("RSI", f"{current_rsi:.1f}", rsi_status, delta_color=rsi_color)
     
     # 趋势强度
     trend_strength = calculate_price_trend(st.session_state.minute_data)
-    col2.metric("趋势强度", f"{trend_strength:.2f}")
+    if trend_strength > 0.5:
+        trend_status = "强势上涨"
+        trend_color = "normal"
+    elif trend_strength < -0.5:
+        trend_status = "强势下跌"
+        trend_color = "inverse"
+    else:
+        trend_status = "震荡"
+        trend_color = "off"
+    
+    col2.metric("趋势强度", f"{trend_strength:.2f}", trend_status, delta_color=trend_color)
     
     # VWAP
     vwap = calculate_vwap(st.session_state.minute_data)
     if vwap:
-        col3.metric("VWAP", f"{vwap:.4f}")
+        vwap_diff = ((closes[-1] - vwap) / vwap * 100)
+        if vwap_diff > 0:
+            vwap_status = "高于VWAP"
+            vwap_color = "normal"
+        else:
+            vwap_status = "低于VWAP"
+            vwap_color = "inverse"
+        
+        col3.metric("VWAP", f"{vwap:.4f}", f"{vwap_diff:.2f}%", delta_color=vwap_color)
     
     # 价格和RSI图表
     fig = make_subplots(rows=2, cols=1, subplot_titles=('价格走势', 'RSI指标'))
@@ -1658,8 +1916,9 @@ def render_tab_indicators():
     fig.add_trace(go.Scatter(x=df['time'], y=rsi_values, name='RSI'), row=2, col=1)
     
     # 添加RSI超买超卖线
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1, annotation_text="超买")
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1, annotation_text="超卖")
+    fig.add_hline(y=50, line_dash="dot", line_color="gray", row=2, col=1)
     
     fig.update_layout(height=600, showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
@@ -1671,48 +1930,28 @@ def render_tab_signals():
         st.warning("⚠️ 请先在【数据】标签页获取或生成分钟数据")
         return
 
-    last_price = st.session_state.minute_data[-1]['close']
-    vwap = calculate_vwap(st.session_state.minute_data)
-    buy_levels = st.session_state.get("buy_grids", [])
-    sell_levels = st.session_state.get("sell_grids", [])
-    
-    # 计算技术指标用于信号判断
-    df = pd.DataFrame(st.session_state.minute_data)
-    ma5 = df['close'].rolling(5).mean().iloc[-1] if len(df) >= 5 else last_price
-    ma20 = df['close'].rolling(20).mean().iloc[-1] if len(df) >= 20 else last_price
-    
-    # 信号判断
-    signals = []
-    
-    # 网格信号
-    if buy_levels and last_price <= buy_levels[0]:
-        signals.append(("🟢", f"价格已接近买入网格 {buy_levels[0]:.4f} → 可以考虑小仓位买入"))
-    elif sell_levels and last_price >= sell_levels[0]:
-        signals.append(("🔴", f"价格已接近卖出网格 {sell_levels[0]:.4f} → 可以考虑部分卖出"))
-    else:
-        signals.append(("🟡", "价格处于网格中性区间，耐心等待信号"))
-    
-    # 趋势信号
-    if ma5 > ma20:
-        signals.append(("🟢", "MA5在MA20上方 → 短期趋势偏多"))
-    else:
-        signals.append(("🔴", "MA5在MA20下方 → 短期趋势偏空"))
-    
-    # VWAP信号
-    if vwap:
-        if last_price > vwap:
-            signals.append(("🟢", "当前价高于VWAP → 资金面偏强"))
-        else:
-            signals.append(("🔴", "当前价低于VWAP → 资金面偏弱"))
+    # 生成交易信号
+    signals = generate_trading_signals(
+        st.session_state.minute_data,
+        st.session_state.get("buy_grids", []),
+        st.session_state.get("sell_grids", []),
+        st.session_state.current_price
+    )
     
     # 显示信号
-    st.subheader("实时交易信号")
+    st.subheader("📊 实时交易信号")
+    
+    if not signals:
+        st.info("🔍 暂无明确交易信号，请检查数据或参数设置")
+        return
     
     for emoji, signal in signals:
         if "🟢" in emoji:
             st.success(f"{emoji} {signal}")
         elif "🔴" in emoji:
             st.error(f"{emoji} {signal}")
+        elif "🔔" in emoji:
+            st.warning(f"{emoji} {signal}")
         else:
             st.info(f"{emoji} {signal}")
     
@@ -1721,15 +1960,31 @@ def render_tab_signals():
     
     buy_signals = sum(1 for s in signals if "🟢" in s[0])
     sell_signals = sum(1 for s in signals if "🔴" in s[0])
-    neutral_signals = sum(1 for s in signals if "🟡" in s[0])
+    neutral_signals = sum(1 for s in signals if "🔔" in s[0])
     
-    if buy_signals > sell_signals:
-        st.success(f"📈 建议：偏多操作（{buy_signals}个买入信号，{sell_signals}个卖出信号）")
-    elif sell_signals > buy_signals:
-        st.error(f"📉 建议：偏空操作（{buy_signals}个买入信号，{sell_signals}个卖出信号）")
+    total_signals = buy_signals + sell_signals + neutral_signals
+    
+    if total_signals > 0:
+        buy_ratio = buy_signals / total_signals * 100
+        sell_ratio = sell_signals / total_signals * 100
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("买入信号", buy_signals, f"{buy_ratio:.1f}%")
+        col2.metric("卖出信号", sell_signals, f"{sell_ratio:.1f}%")
+        col3.metric("中性信号", neutral_signals, f"{(100 - buy_ratio - sell_ratio):.1f}%")
+        
+        if buy_ratio > 60:
+            st.success("🎯 强烈建议：偏多操作，可考虑逢低买入")
+        elif sell_ratio > 60:
+            st.error("🎯 强烈建议：偏空操作，可考虑逢高卖出")
+        elif buy_ratio > sell_ratio:
+            st.success("📈 建议：轻度偏多，可小仓位试多")
+        elif sell_ratio > buy_ratio:
+            st.error("📉 建议：轻度偏空，可小仓位试空")
+        else:
+            st.info("⚖️ 建议：观望为主，等待更明确信号")
     else:
-        st.info(f"⚖️ 建议：观望为主（{buy_signals}个买入信号，{sell_signals}个卖出信号）")
-
+        st.info("📊 暂无足够信号生成操作建议")
 
 def render_tab_help():
     st.subheader("🕒 港股交易时间")
@@ -1755,7 +2010,13 @@ def render_tab_help():
     
     # 显示当前交易状态
     status = get_hk_trading_status()
-    st.info(f"当前状态: {status['status']} - {status['message']}")
+    
+    if status['status'] == '交易中':
+        st.success(f"✅ {status['status']} - {status['message']}")
+    elif status['status'] in ['未开盘', '午间休市']:
+        st.warning(f"⏰ {status['status']} - {status['message']}")
+    else:
+        st.info(f"💤 {status['status']} - {status['message']}")
 
 def render_tab_guide():
     st.subheader("👨‍🏫 新手指南")
@@ -1781,6 +2042,30 @@ def render_tab_guide():
     """)
     
     st.success("💡 提示: 新手建议从模拟数据开始，熟悉策略后再使用真实数据")
+    
+    # 常见问题解答
+    st.subheader("❓ 常见问题解答")
+    
+    with st.expander("如何选择合适的网格间距？"):
+        st.write("""
+        - **高波动ETF**: 建议使用较大间距（0.5%-1.0%）
+        - **低波动ETF**: 建议使用较小间距（0.1%-0.3%）
+        - **新手建议**: 从0.3%开始，根据回测结果调整
+        """)
+    
+    with st.expander("网格数量多少合适？"):
+        st.write("""
+        - **激进型**: 20-30档（交易频繁，收益波动大）
+        - **稳健型**: 10-20档（平衡收益与风险）
+        - **保守型**: 5-10档（交易少，风险低）
+        """)
+    
+    with st.expander("如何设置止损止盈？"):
+        st.write("""
+        - **止损**: 建议设置2-5%，防止大幅亏损
+        - **止盈**: 建议设置5-10%，锁定利润
+        - **跟踪止损**: 从高点回撤2-3%时触发，保护利润
+        """)
 
 # ---------------------------
 # 主应用
@@ -1839,6 +2124,18 @@ def main():
             "fixed_spacing_pct": fixed_spacing_pct,
             "avg_daily_turnover": avg_daily_turnover
         })
+    
+    # 显示当前状态
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("交易本金", f"${st.session_state.principal:,.0f}")
+    with col2:
+        st.metric("ETF代码", st.session_state.etf_code)
+    with col3:
+        st.metric("当前价格", f"${st.session_state.current_price:.4f}")
+    with col4:
+        data_points = len(st.session_state.minute_data) if st.session_state.minute_data else 0
+        st.metric("数据点数", data_points)
     
     # 标签页配置
     tabs = st.tabs([
