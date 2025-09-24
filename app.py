@@ -13,7 +13,86 @@ import ta
 import json
 import time
 import warnings
+import gc
+from io import BytesIO
+from typing import List, Dict, Tuple, Optional, Union
+from functools import wraps
+import os
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
 warnings.filterwarnings('ignore')
+
+# ---------------------------
+# 环境配置加载
+# ---------------------------
+
+def load_environment_config():
+    """加载环境配置"""
+    config = {
+        'debug_mode': os.getenv('DEBUG', 'False').lower() == 'true',
+        'cache_ttl': int(os.getenv('CACHE_TTL', '300')),
+        'max_retries': int(os.getenv('MAX_RETRIES', '3')),
+        'data_timeout': int(os.getenv('DATA_TIMEOUT', '30'))
+    }
+    return config
+
+# 加载配置
+CONFIG = load_environment_config()
+
+# ---------------------------
+# 性能优化工具
+# ---------------------------
+
+def optimize_memory():
+    """优化内存使用"""
+    if len(gc.get_objects()) > 10000:
+        gc.collect()
+
+def timer_decorator(func):
+    """计时装饰器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if CONFIG['debug_mode']:
+            start_time = time.time()
+            result = func(*args, **kwargs)
+            end_time = time.time()
+            execution_time = end_time - start_time
+            if execution_time > 1.0:  # 只显示执行时间超过1秒的函数
+                st.sidebar.write(f"⏱️ {func.__name__} 执行时间: {execution_time:.2f}秒")
+            return result
+        else:
+            return func(*args, **kwargs)
+    return wrapper
+
+def monitor_memory_usage():
+    """监控内存使用情况"""
+    if psutil and CONFIG['debug_mode']:
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+        st.sidebar.write(f"💾 内存使用: {memory_usage:.1f} MB")
+        
+        if memory_usage > 500:  # 如果内存使用超过500MB
+            st.sidebar.warning("内存使用较高，建议清理缓存")
+            if st.sidebar.button("清理内存"):
+                gc.collect()
+                st.rerun()
 
 # ---------------------------
 # 工具函数
@@ -64,6 +143,7 @@ def recommend_slippage_by_turnover(avg_daily_turnover):
         return (0.1, 0.25, 0.5)
     return (0.3, 0.7, 1.5)
 
+@timer_decorator
 def calculate_trade_cost_simple(amount, cfg, side='buy'):
     """计算交易成本"""
     if amount <= 0:
@@ -127,6 +207,7 @@ def get_hk_trading_status():
 # 增强技术指标计算
 # ---------------------------
 
+@timer_decorator
 def calculate_macd(prices, fast=12, slow=26, signal=9):
     """计算MACD指标"""
     if len(prices) < slow:
@@ -141,6 +222,7 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     
     return df['MACD'].iloc[-1], df['MACD_signal'].iloc[-1], df['MACD_histogram'].iloc[-1]
 
+@timer_decorator
 def calculate_bollinger_bands(prices, window=20, num_std=2):
     """计算布林带"""
     if len(prices) < window:
@@ -154,6 +236,7 @@ def calculate_bollinger_bands(prices, window=20, num_std=2):
     
     return df['Upper'].iloc[-1], df['MA'].iloc[-1], df['Lower'].iloc[-1]
 
+@timer_decorator
 def calculate_ichimoku_cloud(highs, lows, closes, tenkan=9, kijun=26, senkou=52):
     """计算一目均衡表（Ichimoku Cloud）"""
     if len(closes) < senkou:
@@ -192,6 +275,7 @@ def calculate_ichimoku_cloud(highs, lows, closes, tenkan=9, kijun=26, senkou=52)
         'chikou': chikou_span.iloc[-kijun] if len(closes) >= kijun*2 else None
     }
 
+@timer_decorator
 def calculate_fibonacci_levels(high, low):
     """计算斐波那契回撤水平"""
     diff = high - low
@@ -205,6 +289,7 @@ def calculate_fibonacci_levels(high, low):
         '100.0%': low
     }
 
+@timer_decorator
 def calculate_support_resistance(prices, window=20):
     """自动计算支撑阻力位"""
     if len(prices) < window:
@@ -226,9 +311,10 @@ def calculate_support_resistance(prices, window=20):
     return support, resistance
 
 # ---------------------------
-# 机器学习辅助预测（简化版）
+# 机器学习辅助预测
 # ---------------------------
 
+@timer_decorator
 def calculate_price_trend(minute_data, lookback_periods=[5, 10, 20]):
     """计算价格趋势强度"""
     if len(minute_data) < max(lookback_periods):
@@ -248,6 +334,7 @@ def calculate_price_trend(minute_data, lookback_periods=[5, 10, 20]):
     
     return trend_strength
 
+@timer_decorator
 def predict_next_movement(minute_data, method='simple'):
     """简单预测下一期价格运动"""
     if len(minute_data) < 10:
@@ -274,11 +361,101 @@ def predict_next_movement(minute_data, method='simple'):
         
     return direction, confidence
 
+@timer_decorator
+def create_ml_prediction_model(minute_data, lookback=20):
+    """创建机器学习预测模型"""
+    if not SKLEARN_AVAILABLE or len(minute_data) < lookback + 10:
+        return None, None
+    
+    # 准备特征数据
+    closes = [d['close'] for d in minute_data]
+    volumes = [d['volume'] for d in minute_data]
+    
+    features = []
+    targets = []
+    
+    for i in range(lookback, len(closes) - 1):
+        # 技术指标特征
+        feature_set = []
+        
+        # 价格特征
+        recent_prices = closes[i-lookback:i]
+        feature_set.extend([
+            np.mean(recent_prices),
+            np.std(recent_prices),
+            np.max(recent_prices),
+            np.min(recent_prices),
+            recent_prices[-1] - recent_prices[0]  # 价格变化
+        ])
+        
+        # 成交量特征
+        recent_volumes = volumes[i-lookback:i]
+        feature_set.extend([
+            np.mean(recent_volumes),
+            np.std(recent_volumes),
+            volumes[i] / np.mean(recent_volumes) if np.mean(recent_volumes) > 0 else 1
+        ])
+        
+        # 目标变量：下一期价格变化
+        target = (closes[i+1] - closes[i]) / closes[i] * 100
+        
+        features.append(feature_set)
+        targets.append(target)
+    
+    if len(features) < 10:
+        return None, None
+    
+    # 训练模型
+    X = np.array(features)
+    y = np.array(targets)
+    
+    # 标准化特征
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X_scaled, y)
+    
+    return model, scaler
+
+@timer_decorator
+def predict_with_ml(model, scaler, minute_data, lookback=20):
+    """使用机器学习模型进行预测"""
+    if not model or len(minute_data) < lookback:
+        return 0, 0.5
+    
+    closes = [d['close'] for d in minute_data]
+    volumes = [d['volume'] for d in minute_data]
+    
+    # 准备当前特征
+    recent_prices = closes[-lookback:]
+    recent_volumes = volumes[-lookback:]
+    
+    feature_set = [
+        np.mean(recent_prices),
+        np.std(recent_prices),
+        np.max(recent_prices),
+        np.min(recent_prices),
+        recent_prices[-1] - recent_prices[0],
+        np.mean(recent_volumes),
+        np.std(recent_volumes),
+        volumes[-1] / np.mean(recent_volumes) if np.mean(recent_volumes) > 0 else 1
+    ]
+    
+    X_current = scaler.transform([feature_set])
+    prediction = model.predict(X_current)[0]
+    
+    # 转换为方向和置信度
+    direction = 1 if prediction > 0 else -1
+    confidence = min(abs(prediction) / 2, 0.8)  # 限制置信度范围
+    
+    return direction, confidence
+
 # ---------------------------
 # 数据获取函数
 # ---------------------------
 
-@st.cache_data(ttl=300)  # 5分钟缓存
+@st.cache_data(ttl=CONFIG['cache_ttl'])
 def cached_yahoo_download(ticker, period, interval):
     """带缓存的数据下载"""
     try:
@@ -287,7 +464,8 @@ def cached_yahoo_download(ticker, period, interval):
         st.error(f"下载数据失败: {e}")
         return None
 
-def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d", max_retries=3):
+@timer_decorator
+def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d", max_retries=CONFIG['max_retries']):
     """从雅虎财经获取分钟数据（带重试机制）"""
     for attempt in range(max_retries):
         try:
@@ -360,6 +538,8 @@ def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d", max_retries=3)
                         "volume": int(v)
                     })
             
+            # 内存优化
+            optimize_memory()
             return minute_data
             
         except Exception as e:
@@ -372,6 +552,7 @@ def fetch_minute_data_yahoo(etf_code, interval="5m", period="1d", max_retries=3)
     
     return []
 
+@timer_decorator
 def validate_minute_data(minute_data):
     """验证分钟数据质量"""
     if not minute_data:
@@ -398,6 +579,7 @@ def validate_minute_data(minute_data):
     else:
         return True, "数据质量良好"
 
+@timer_decorator
 def generate_default_minute_data(current_price=27.5, interval=5):
     """生成模拟分钟数据"""
     minute_data = []
@@ -434,6 +616,7 @@ def generate_default_minute_data(current_price=27.5, interval=5):
 # 技术指标计算
 # ---------------------------
 
+@timer_decorator
 def calculate_atr(highs, lows, closes, period=14):
     """计算平均真实波幅(ATR)"""
     if len(closes) == 0:
@@ -444,6 +627,7 @@ def calculate_atr(highs, lows, closes, period=14):
     atr = pd.Series(tr).rolling(window=period, min_periods=1).mean().round(6).tolist()
     return atr
 
+@timer_decorator
 def calculate_vwap(minute_data):
     """计算成交量加权平均价(VWAP)"""
     if not minute_data:
@@ -454,6 +638,7 @@ def calculate_vwap(minute_data):
         return None
     return round(float((prices * volumes).sum() / volumes.sum()), 6)
 
+@timer_decorator
 def calculate_rsi_optimized(prices, period=14):
     """优化版的RSI计算"""
     if len(prices) < period:
@@ -471,10 +656,12 @@ def calculate_rsi_optimized(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50).tolist()
 
+@timer_decorator
 def calculate_rsi(prices, period=14):
     """计算相对强弱指数(RSI) - 兼容旧版本"""
     return calculate_rsi_optimized(prices, period)
 
+@timer_decorator
 def calculate_obv(prices, volumes):
     """计算能量潮(OBV)"""
     if len(prices) < 2:
@@ -495,15 +682,39 @@ def calculate_obv(prices, volumes):
 # 风险管理模块
 # ---------------------------
 
-class RiskManager:
-    """风险管理器"""
+class EnhancedRiskManager:
+    """
+    增强版风险管理器
     
-    def __init__(self, max_daily_loss_pct=2.0, max_position_pct=50.0):
+    用于管理交易风险，包括仓位控制、止损止盈等。
+    
+    Attributes:
+        max_daily_loss_pct (float): 单日最大亏损百分比
+        max_position_pct (float): 最大仓位百分比
+        volatility_threshold (float): 波动率阈值
+        daily_pnl (float): 当日盈亏
+        trade_count (int): 交易次数
+        trade_history (list): 交易历史
+        risk_scores (list): 风险评分历史
+    """
+    
+    def __init__(self, max_daily_loss_pct=2.0, max_position_pct=50.0, volatility_threshold=3.0):
+        """
+        初始化风险管理器
+        
+        Args:
+            max_daily_loss_pct: 单日最大亏损百分比，默认2%
+            max_position_pct: 最大仓位百分比，默认50%
+            volatility_threshold: 波动率阈值，默认3%
+        """
         self.max_daily_loss_pct = max_daily_loss_pct
         self.max_position_pct = max_position_pct
+        self.volatility_threshold = volatility_threshold
         self.daily_pnl = 0.0
         self.trade_count = 0
-        
+        self.trade_history = []
+        self.risk_scores = []
+    
     def check_trade_approval(self, trade_type, amount, current_position, total_capital):
         """检查交易是否被批准"""
         # 仓位限制检查
@@ -525,10 +736,114 @@ class RiskManager:
         loss_pct = abs(self.daily_pnl) / total_capital * 100
         return loss_pct >= self.max_daily_loss_pct and self.daily_pnl < 0
 
+    def calculate_volatility_risk(self, prices, window=20):
+        """计算波动率风险"""
+        if len(prices) < window:
+            return 0
+        
+        returns = np.diff(prices) / prices[:-1]
+        volatility = np.std(returns) * math.sqrt(252) * 100  # 年化波动率
+        
+        # 风险评分：0-10分，越高风险越大
+        risk_score = min(volatility / 10, 10)
+        return risk_score
+    
+    def assess_market_condition(self, minute_data):
+        """评估市场状况"""
+        if not minute_data or len(minute_data) < 20:
+            return "未知", 5
+        
+        closes = [d['close'] for d in minute_data]
+        volumes = [d['volume'] for d in minute_data]
+        
+        # 计算多个风险指标
+        volatility_risk = self.calculate_volatility_risk(closes)
+        
+        # 成交量异常检测
+        avg_volume = np.mean(volumes[:-5])
+        current_volume = volumes[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+        volume_risk = min(abs(volume_ratio - 1) * 2, 10)  # 成交量偏离度风险
+        
+        # 价格趋势风险
+        price_change = (closes[-1] - closes[0]) / closes[0] * 100
+        trend_risk = min(abs(price_change) / 5, 10)
+        
+        # 综合风险评分
+        total_risk = (volatility_risk + volume_risk + trend_risk) / 3
+        
+        # 风险等级
+        if total_risk < 3:
+            return "低风险", total_risk
+        elif total_risk < 6:
+            return "中等风险", total_risk
+        else:
+            return "高风险", total_risk
+    
+    def should_reduce_position(self, current_position, total_capital, market_condition):
+        """是否应该减仓"""
+        position_pct = (current_position / total_capital) * 100
+        
+        if market_condition == "高风险" and position_pct > 20:
+            return True, f"市场高风险，建议将仓位从{position_pct:.1f}%降至20%以下"
+        elif market_condition == "中等风险" and position_pct > 40:
+            return True, f"市场中风险，建议将仓位从{position_pct:.1f}%降至40%以下"
+        
+        return False, "仓位水平适当"
+
+# ---------------------------
+# 实时监控系统
+# ---------------------------
+
+class RealTimeMonitor:
+    """实时监控器"""
+    
+    def __init__(self):
+        self.alert_history = []
+        self.price_alerts = []
+        self.volume_alerts = []
+    
+    def setup_price_alert(self, price, condition, message):
+        """设置价格警报"""
+        self.price_alerts.append({
+            'price': price,
+            'condition': condition,  # 'above' or 'below'
+            'message': message
+        })
+    
+    def check_alerts(self, current_price, current_volume, minute_data):
+        """检查所有警报"""
+        active_alerts = []
+        
+        # 检查价格警报
+        for alert in self.price_alerts:
+            if alert['condition'] == 'above' and current_price >= alert['price']:
+                active_alerts.append(("💰", alert['message']))
+            elif alert['condition'] == 'below' and current_price <= alert['price']:
+                active_alerts.append(("💰", alert['message']))
+        
+        # 检查成交量警报
+        if len(minute_data) > 10:
+            avg_volume = np.mean([d['volume'] for d in minute_data[:-5]])
+            if current_volume > avg_volume * 2:
+                active_alerts.append(("📊", f"成交量异常放大: {current_volume/avg_volume:.1f}倍"))
+        
+        # 检查技术指标警报
+        if len(minute_data) > 14:
+            closes = [d['close'] for d in minute_data]
+            rsi = calculate_rsi(closes)[-1]
+            if rsi > 80:
+                active_alerts.append(("⚠️", f"RSI超买: {rsi:.1f}"))
+            elif rsi < 20:
+                active_alerts.append(("⚠️", f"RSI超卖: {rsi:.1f}"))
+        
+        return active_alerts
+
 # ---------------------------
 # 智能网格生成函数
 # ---------------------------
 
+@timer_decorator
 def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, grid_upper, grid_lower, 
                                     center_moving=False, center_price=None, volatility_mode=False, 
                                     minute_data=None, trend_adjustment=False):
@@ -570,6 +885,7 @@ def generate_intraday_grid_arithmetic(current_price, spacing_pct, grid_count, gr
     buy.sort(); sell.sort()
     return buy, sell
 
+@timer_decorator
 def generate_adaptive_grid(current_price, minute_data, grid_count=16, method='volatility'):
     """自适应网格生成"""
     if not minute_data or len(minute_data) < 10:
@@ -611,6 +927,7 @@ def generate_adaptive_grid(current_price, minute_data, grid_count=16, method='vo
 # 回测引擎
 # ---------------------------
 
+@timer_decorator
 def calculate_max_drawdown_from_series(net_values):
     """计算最大回撤"""
     if not net_values:
@@ -620,6 +937,7 @@ def calculate_max_drawdown_from_series(net_values):
     dd = (rm - s) / rm
     return round(float(dd.max() * 100), 4)
 
+@timer_decorator
 def compute_risk_metrics(net_values, principal, profit_rate, max_drawdown, trade_records, minute_data):
     """计算风险指标"""
     metrics = {}
@@ -698,6 +1016,7 @@ def compute_risk_metrics(net_values, principal, profit_rate, max_drawdown, trade
     
     return metrics
 
+@timer_decorator
 def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sell_grids, minute_data, cfg):
     """改进的日内策略回测"""
     trade_records = []
@@ -922,6 +1241,9 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
     
     metrics = compute_risk_metrics(net_values, principal, profit_rate, max_drawdown, trade_records, minute_data)
     
+    # 内存优化
+    optimize_memory()
+    
     return {
         "trade_records": trade_records,
         "final_total_value": round(final_total, 2),
@@ -941,6 +1263,7 @@ def backtest_intraday_strategy_improved(principal, current_price, buy_grids, sel
 # 参数优化模块
 # ---------------------------
 
+@timer_decorator
 def optimize_grid_parameters(principal, minute_data, cfg, param_ranges):
     """网格参数优化"""
     best_params = None
@@ -1007,6 +1330,7 @@ def optimize_grid_parameters(principal, minute_data, cfg, param_ranges):
 # 敏感性分析和ETF对比
 # ---------------------------
 
+@timer_decorator
 def analyze_grid_sensitivity(principal, current_price, minute_data, cfg, base_params):
     """分析网格参数敏感性"""
     results = []
@@ -1028,6 +1352,7 @@ def analyze_grid_sensitivity(principal, current_price, minute_data, cfg, base_pa
             })
     return pd.DataFrame(results)
 
+@timer_decorator
 def compare_etfs(etf_codes, principal, data_interval, cfg):
     """对比多个ETF的日内T+0效果"""
     comparison = []
@@ -1063,6 +1388,7 @@ def compare_etfs(etf_codes, principal, data_interval, cfg):
 # 实时交易信号系统
 # ---------------------------
 
+@timer_decorator
 def generate_trading_signals(minute_data, buy_grids, sell_grids, current_price):
     """生成实时交易信号"""
     signals = []
@@ -1149,6 +1475,76 @@ def load_configuration(uploaded_file):
     except Exception as e:
         st.error(f"加载配置失败: {e}")
         return None
+
+# ---------------------------
+# 数据导出功能
+# ---------------------------
+
+def add_data_export():
+    """添加数据导出功能"""
+    if st.session_state.get("minute_data"):
+        df = pd.DataFrame(st.session_state.minute_data)
+        
+        # CSV导出
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="📥 导出CSV数据",
+            data=csv,
+            file_name=f"{st.session_state.etf_code}_data.csv",
+            mime="text/csv"
+        )
+        
+        # Excel导出
+        @st.cache_data
+        def convert_df_to_excel(df):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='分钟数据')
+            return output.getvalue()
+        
+        excel_data = convert_df_to_excel(df)
+        st.download_button(
+            label="📊 导出Excel数据",
+            data=excel_data,
+            file_name=f"{st.session_state.etf_code}_data.xlsx",
+            mime="application/vnd.ms-excel"
+        )
+
+# ---------------------------
+# 快捷键支持
+# ---------------------------
+
+def add_keyboard_shortcuts():
+    """添加快捷键支持"""
+    st.markdown("""
+    <script>
+    document.addEventListener('keydown', function(e) {
+        // Ctrl+R 刷新数据
+        if (e.ctrlKey && e.key === 'r') {
+            e.preventDefault();
+            window.location.reload();
+        }
+    });
+    </script>
+    """, unsafe_allow_html=True)
+
+# ---------------------------
+# 健康检查
+# ---------------------------
+
+def add_health_check():
+    """添加健康检查"""
+    if CONFIG.get("production", False):
+        # 在生产环境中添加健康检查
+        try:
+            if psutil:
+                cpu_usage = psutil.cpu_percent()
+                memory_usage = psutil.virtual_memory().percent
+                
+                if cpu_usage > 90 or memory_usage > 90:
+                    st.error("⚠️ 系统资源紧张，请检查服务器状态")
+        except:
+            pass
 
 # ---------------------------
 # 侧边栏参数设置（优化版）
@@ -1450,6 +1846,10 @@ def render_tab_data():
         
         st.subheader("数据预览")
         st.dataframe(df, height=300, use_container_width=True)
+        
+        # 数据导出功能
+        st.subheader("📤 数据导出")
+        add_data_export()
         
         # 数据质量检查
         st.subheader("📋 数据质量检查")
@@ -1996,6 +2396,29 @@ def render_tab_advanced_analysis():
     else:
         st.error(f"预测方向: 📉 下跌 | 置信度: {confidence*100:.1f}%")
     
+    # 机器学习预测
+    if SKLEARN_AVAILABLE and len(st.session_state.minute_data) > 30:
+        st.subheader("🤖 机器学习预测")
+        if st.button("训练机器学习模型"):
+            with st.spinner("训练模型中..."):
+                model, scaler = create_ml_prediction_model(st.session_state.minute_data)
+                if model:
+                    st.session_state.ml_model = model
+                    st.session_state.ml_scaler = scaler
+                    st.success("模型训练完成")
+        
+        if 'ml_model' in st.session_state and 'ml_scaler' in st.session_state:
+            ml_direction, ml_confidence = predict_with_ml(
+                st.session_state.ml_model, 
+                st.session_state.ml_scaler, 
+                st.session_state.minute_data
+            )
+            
+            if ml_direction > 0:
+                st.success(f"ML预测方向: 📈 上涨 | 置信度: {ml_confidence*100:.1f}%")
+            else:
+                st.error(f"ML预测方向: 📉 下跌 | 置信度: {ml_confidence*100:.1f}%")
+    
     # 趋势强度分析
     trend_strength = calculate_price_trend(st.session_state.minute_data)
     if abs(trend_strength) > 1:
@@ -2276,6 +2699,10 @@ def render_tab_signals():
         st.warning("⚠️ 请先在【数据】标签页获取或生成分钟数据")
         return
 
+    # 初始化监控器
+    if "monitor" not in st.session_state:
+        st.session_state.monitor = RealTimeMonitor()
+    
     # 生成交易信号
     signals = generate_trading_signals(
         st.session_state.minute_data,
@@ -2289,17 +2716,54 @@ def render_tab_signals():
     
     if not signals:
         st.info("🔍 暂无明确交易信号，请检查数据或参数设置")
-        return
+    else:
+        for emoji, signal in signals:
+            if "🟢" in emoji:
+                st.success(f"{emoji} {signal}")
+            elif "🔴" in emoji:
+                st.error(f"{emoji} {signal}")
+            elif "🔔" in emoji:
+                st.warning(f"{emoji} {signal}")
+            else:
+                st.info(f"{emoji} {signal}")
     
-    for emoji, signal in signals:
-        if "🟢" in emoji:
-            st.success(f"{emoji} {signal}")
-        elif "🔴" in emoji:
-            st.error(f"{emoji} {signal}")
-        elif "🔔" in emoji:
-            st.warning(f"{emoji} {signal}")
+    # 实时监控警报
+    st.subheader("🔔 实时监控警报")
+    
+    if st.session_state.minute_data:
+        current_data = st.session_state.minute_data[-1]
+        current_price = current_data['close']
+        current_volume = current_data['volume']
+        
+        alerts = st.session_state.monitor.check_alerts(
+            current_price, current_volume, st.session_state.minute_data
+        )
+        
+        if alerts:
+            for emoji, alert in alerts:
+                st.warning(f"{emoji} {alert}")
         else:
-            st.info(f"{emoji} {signal}")
+            st.info("🔍 当前无触发警报")
+    
+    # 警报设置
+    with st.expander("⚙️ 设置监控警报"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            alert_price = st.number_input("警报价格", value=st.session_state.current_price)
+            alert_condition = st.selectbox("条件", ["above", "below"])
+            alert_message = st.text_input("警报消息", value="价格触发警报")
+            
+            if st.button("添加价格警报"):
+                st.session_state.monitor.setup_price_alert(
+                    alert_price, alert_condition, alert_message
+                )
+                st.success("价格警报已添加")
+        
+        with col2:
+            st.write("当前活跃警报:")
+            for alert in st.session_state.monitor.price_alerts:
+                st.write(f"- {alert['condition']} {alert['price']}: {alert['message']}")
     
     # 操作建议汇总
     st.subheader("💎 操作建议汇总")
@@ -2413,6 +2877,52 @@ def render_tab_guide():
         - **跟踪止损**: 从高点回撤2-3%时触发，保护利润
         """)
 
+def render_tab_debug():
+    st.subheader("🐛 调试和测试")
+    
+    # 性能监控
+    if CONFIG['debug_mode']:
+        st.subheader("📊 性能监控")
+        monitor_memory_usage()
+        
+        if st.button("运行内存清理"):
+            gc.collect()
+            st.success("内存已清理")
+    
+    # 缓存管理
+    st.subheader("🗃️ 缓存管理")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("清理数据缓存"):
+            st.cache_data.clear()
+            st.success("数据缓存已清理")
+    
+    with col2:
+        if st.button("清理计算缓存"):
+            if 'minute_data' in st.session_state:
+                del st.session_state.minute_data
+            if 'backtest_result' in st.session_state:
+                del st.session_state.backtest_result
+            st.success("计算缓存已清理")
+    
+    # 会话状态管理
+    st.subheader("⚙️ 会话状态管理")
+    if st.button("重置会话状态"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.success("会话状态已重置")
+        st.rerun()
+    
+    # 环境信息
+    st.subheader("🌐 环境信息")
+    st.write(f"调试模式: {CONFIG['debug_mode']}")
+    st.write(f"缓存TTL: {CONFIG['cache_ttl']}秒")
+    st.write(f"最大重试次数: {CONFIG['max_retries']}")
+    st.write(f"数据超时: {CONFIG['data_timeout']}秒")
+    st.write(f"Scikit-learn可用: {SKLEARN_AVAILABLE}")
+    st.write(f"PSUtil可用: {psutil is not None}")
+
 # ---------------------------
 # 主应用
 # ---------------------------
@@ -2427,6 +2937,12 @@ def main():
     
     # 设置主题
     setup_theme()
+    
+    # 添加快捷键支持
+    add_keyboard_shortcuts()
+    
+    # 健康检查
+    add_health_check()
     
     # 应用标题和介绍
     st.title("📈 ETF日内T+0网格交易策略 - 增强专业版")
@@ -2458,8 +2974,9 @@ def main():
             "buy_grids": [],
             "sell_grids": [],
             "backtest_result": None,
-            "risk_manager": RiskManager(),
-            "optimization_results": None
+            "risk_manager": EnhancedRiskManager(),
+            "optimization_results": None,
+            "monitor": RealTimeMonitor()
         })
     else:
         # 更新参数
@@ -2491,7 +3008,7 @@ def main():
     # 标签页配置
     tabs = st.tabs([
         "📊 数据", "🎯 策略", "📈 回测", "🔬 高级分析", "⚡ 参数优化", 
-        "📊 ETF对比", "📈 趋势指标", "🔔 策略信号", "🕒 交易时间", "👨‍🏫 新手指南"
+        "📊 ETF对比", "📈 趋势指标", "🔔 策略信号", "🕒 交易时间", "👨‍🏫 新手指南", "🐛 调试"
     ])
     
     with tabs[0]:
@@ -2514,6 +3031,8 @@ def main():
         render_tab_help()
     with tabs[9]:
         render_tab_guide()
+    with tabs[10]:
+        render_tab_debug()
     
     # 页脚信息
     st.markdown("---")
@@ -2523,6 +3042,9 @@ def main():
     <p>⚠️ 风险提示: 本系统仅供学习参考，实际交易请谨慎决策</p>
     </div>
     """, unsafe_allow_html=True)
+    
+    # 定期内存优化
+    optimize_memory()
 
 if __name__ == "__main__":
     main()
